@@ -1,0 +1,5 @@
+*.pyc
+src/**/*.png
+src/**/*.json
+*.las
+*.ply

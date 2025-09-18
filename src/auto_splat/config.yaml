@@ -1,0 +1,46 @@
+# config.yaml
+
+render:
+  width: 1280
+  height: 960
+  hfov_deg: 60.0
+  overlap: 0.75
+  fps: 3
+  scale_gain: 1.0     # 若使用exp(scale)，可乘一个增益
+  antialias: true
+  near: 0.001
+  far: 1000000.0
+
+free_space:
+  grid_res: 0.4           # 2D 栅格分辨率(米/格)：越小越精细，越慢
+  radius_gain: 2.5         # 把 3DGS 的 exp(scale) 映射到2D“占据半径”的系数
+  d_min: 1.0               # 路径距离高斯的最小安全距离(米)
+  d_max: 10.0               # 路径距离高斯的最大观测距离(米)
+  d_target_ratio: 0.6      # 在[d_min, d_max]之间选目标距离：d* = d_min*(1-r)+d_max*r
+  band_width: 0.6          # 等距带宽(±band/2)，便于找到连续闭环（米）
+  height_offset: 0.2       # 相机相对主平面的高度偏置（米）
+  loop_samples: 400        # 闭环最终采样点数（用于圆滑曲线）
+  spline_smooth: 0.0       # B样条平滑强度（0~1，小场景用0或0.1）
+  polar_angles: 2048       # 极坐标射线数量（越多曲线越圆滑）
+
+roi:
+  voxel: 0.4
+  min_count: 40
+  keep_top_percent: 0.8
+
+# skeleton:
+#   voxel_track: 0.25    # 骨架体素步长（轨迹粒度）
+#   min_component_ratio: 0.02  # 只保留连通分量中体素数 ≥ 全部的该比例
+#   smooth_window: 5     # 轨迹平滑窗口（移动平均）
+
+sampling:
+  min_visible: 15000   # 每帧可见高斯核中心的最少数量
+  vis_sample_max: 300000  # 估计可见性时的随机采样上限
+  step_safety: 0.8     # 步长安全系数（<1 更保守）
+  max_skip: 10         # 连续跳过不达标位姿的最大次数（防止死循环）
+
+paths:
+  ply_path: "/workspace/src/data/point_cloud_gs.ply"
+  out_dir: "/workspace/src/auto_splat/resplat_output"
+
+device: "cuda"
