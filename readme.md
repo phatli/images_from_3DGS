@@ -34,7 +34,8 @@ bash run.bash
 
 ```bash
 docker pull stephenmao0927/gsr:v2   #先拉取镜像
-bash docker/run_all.bash   #一步到位启动container、设置参数和启动
+cd docker
+bash run_all.bash   #一步到位启动container、设置参数和启动
 ```
 
 ### 界面与交互
