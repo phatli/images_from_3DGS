@@ -30,7 +30,15 @@ cd manual_splat
 bash run.bash
 ```
 
+**[Update]** 傻瓜式启动脚本
+
+```bash
+docker pull stephenmao0927/gsr:v2   #先拉取镜像
+bash docker/run_all.bash   #一步到位启动container、设置参数和启动
+```
+
 ### 界面与交互
+
 - **视角控制**：左键拖动旋转、右键拖动平移、滚轮缩放  
 
 - **选平面**：右侧 `Slice plane z` 输入框设置 z，点 `Update / Show plane` 刷新蓝色平面 
