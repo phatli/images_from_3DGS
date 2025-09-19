@@ -23,7 +23,7 @@ services:
     ipc: host
     shm_size: "16g"
     volumes:
-      - ../src:/workspace/src
+      - ./../src:/workspace/src
       - /tmp/.X11-unix:/tmp/.X11-unix
     working_dir: /workspace/src
     tty: true

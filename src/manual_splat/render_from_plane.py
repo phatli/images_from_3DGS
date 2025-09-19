@@ -156,6 +156,7 @@ def render_and_save_rt(
     K_torch, W, H = _make_K_tensor(intrinsics, device)
 
     saved = []
+    
     for (R, t), path in zip(poses_rt, img_paths):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         viewmats = _rt_to_viewmat(R, t, device)  # (1,4,4)
@@ -199,6 +200,7 @@ def render_and_save_Twc(
     其余参数同 render_and_save_rt。
     """
     poses_rt: List[RT] = []
+        
     for T in poses_Twc:
         R_wc, t_wc = _twc_to_rt(T)
         poses_rt.append((R_wc, t_wc))

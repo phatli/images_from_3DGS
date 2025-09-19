@@ -16,11 +16,6 @@ Overview:
    - Overlap (Jaccard over visible sets) with the last kept frame.
 6) Export intrinsics + poses to JSON (optionally convert later to (R,t) for renderers or SfM tools).
 
-Notes:
-- This app focuses on planning and pose export. Rendering images is out of scope.
-- Free-space estimation is approximated via a thin slab projection near the plane (optional for manual picking guidance).
-- Tested with Open3D >= 0.16; compatible with 0.19.0 (no camera.create_ray required).
-
 Usage (example):
     python manual_plane.py \
         --gaussians path/to/model_means_scales.npz \
@@ -49,6 +44,7 @@ import open3d.visualization.rendering as rendering
 
 from tqdm import tqdm  
 from render_from_plane import render_and_save_Twc
+from render_depth import render_depth_and_save_Twc
 
 # ==========================
 # Data structures & utilities
@@ -738,6 +734,8 @@ class App:
         print("Generating rendered images...")
         
         os.makedirs(self.args.img_paths, exist_ok=True)
+        os.makedirs(self.args.depth_paths, exist_ok=True)
+        
         from load_ply import load_gaussians_from_ply
         scene = load_gaussians_from_ply(self.args.gaussians, device="cuda")
         for k in scene:
@@ -788,6 +786,17 @@ class App:
             device="cuda"
         )
 
+        depth_paths = [os.path.join(self.args.depth_paths + '/' + str(self.click_generation_num), f"frame_{i:04d}.png") for i in range(len(kept_poses))]
+
+        saved_depth_paths = render_depth_and_save_Twc(
+            poses_Twc=kept_poses,
+            img_paths=depth_paths,
+            model=model,
+            intrinsics=intr,
+            device="cuda",
+            depth_scale=1000.0           # 米->毫米
+        )
+
 # ==========================
 # Entry
 # ==========================
@@ -797,6 +806,7 @@ def main():
     parser.add_argument("--gaussians", type=str, required=True, help=".npz with means(,scales) or .ply as centers")
     parser.add_argument("--pose_outdir", type=str, default="./manual_out_poses")
     parser.add_argument("--img_paths", type=str, default="./manual_out_img", help="Path to the output images")
+    parser.add_argument("--depth_paths", type=str, default="./manual_out_depth", help="Path to the output depth maps")
     parser.add_argument("--default_scale", type=float, default=0.05, help="Default Gaussian approx scale for .ply")
 
     # Camera / frustum

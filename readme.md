@@ -48,9 +48,13 @@ bash run.bash
 
 - **生成与导出**：`Generate poses & export JSON & render images` → 输出json和png
 
-  ![image-20250918155820867](./images/image-20250918155820867.png)
+  **[Update 2025/09/19]** 同时会生成每个位置对应的深度图，以16 位 PNG 图像按照mm(`depth_scale=1000.0`)为单位保存。
 
-  ![image-20250918160639251](./images/image-20250918160639251.png)
+  ![image-20250918155820867](./images/image-20250918155820867.png)
+  
+  ![image-20250918160639251](./images/frame_0007.png)
+  
+  ![image-20250918160639251](./images/frame_0007_d.png)
 
 ---
 
