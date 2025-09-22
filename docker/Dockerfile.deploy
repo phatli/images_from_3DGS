@@ -1,0 +1,44 @@
+# Minimal runtime image for deployment
+FROM nvidia/cuda:12.1.1-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=Asia/Singapore \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+# Runtime libs + Python
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-venv python3-pip \
+    ca-certificates ffmpeg \
+    libglib2.0-0 libgl1 libegl1 libxext6 libxrender1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Isolated environment
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Python deps actually used by this repo (GPU wheels)
+RUN python3 -m pip install --upgrade pip wheel setuptools && \
+    pip install --no-cache-dir \
+      torch==2.4.0+cu121 \
+      --index-url https://download.pytorch.org/whl/cu121 && \
+    pip install --no-cache-dir \
+      numpy==1.26.4 \
+      scipy \
+      imageio==2.34.0 \
+      transforms3d \
+      tqdm \
+      pyyaml \
+      plyfile \
+      open3d==0.18.0 \
+      gsplat
+
+WORKDIR /workspace/src
+# Copy only the source tree used at runtime
+COPY src/ /workspace/src/
+
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics \
+    TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0+PTX"
+
+CMD ["/bin/bash"]

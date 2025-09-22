@@ -1,60 +1,73 @@
 # ===== 基础镜像：CUDA 12.1 + 构建工具 =====
-FROM nvidia/cuda:12.1.1-devel-ubuntu22.04
+#################################################################
+# Multi-stage Dockerfile optimized for minimal runtime image size
+# Builder stage: use devel image to install build deps and create venv
+# Runtime stage: use cuda runtime image and copy only the venv + minimal OS libs
+#################################################################
+
+FROM nvidia/cuda:12.1.1-devel-ubuntu22.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive \
     TZ=Asia/Singapore \
     PIP_NO_CACHE_DIR=1 \
     PYTHONUNBUFFERED=1 \
-    FORCE_CUDA=1
+    TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0+PTX"
 
-# ---- 系统依赖 ----
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git curl ca-certificates wget \
-    build-essential cmake ninja-build \
-    ffmpeg \
-    libglib2.0-0 libgl1 libegl1 libxext6 libxrender1 \
+    python3 python3-venv python3-distutils python3-pip python3-dev \
+    build-essential ca-certificates cmake ninja-build \
     && rm -rf /var/lib/apt/lists/*
 
-# ---- Python & PyTorch（CUDA 12.1 对应预编译轮子）----
-RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip python3-dev && \
-    rm -rf /var/lib/apt/lists/*
 RUN python3 -m pip install --upgrade pip wheel setuptools
 
-# PyTorch + CUDA 12.1（官方索引）
-RUN pip install --no-cache-dir \
-    torch==2.4.0+cu121 torchvision==0.19.0+cu121 torchaudio==2.4.0+cu121 \
-    --index-url https://download.pytorch.org/whl/cu121
+# Create a venv and install Python packages there to allow copying into a smaller runtime image
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
-# ---- 基础科学栈 & 常用依赖 ----
+# Install only the Python packages actually used by this repo
+# - Drop torchvision/torchaudio and nerfstudio to reduce size/time
+# - Add open3d (required by manual_splat GUI)
 RUN pip install --no-cache-dir \
+    torch==2.4.0+cu121 \
+    --index-url https://download.pytorch.org/whl/cu121 && \
+    pip install --no-cache-dir \
     numpy==1.26.4 \
     imageio==2.34.0 \
     transforms3d \
-    matplotlib \
-    tqdm pyyaml ninja \
+    tqdm \
+    pyyaml \
     scipy \
-    plyfile
+    plyfile \
+    open3d==0.18.0 \
+    gsplat
 
-# ---- 安装 nerfstudio（含 3DGS 渲染功能、viewer、ns-render）----
-# 可固定版本号，或安装主分支稳定版本。为简洁起见用 PyPI。
-RUN pip install --no-cache-dir "nerfstudio[all]==1.1.3"
+#################################################################
+FROM nvidia/cuda:12.1.1-runtime-ubuntu22.04
 
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=Asia/Singapore \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
 
-# gsplat
-RUN pip install --no-cache-dir \
-    torch==2.4.0+cu121 torchvision==0.19.0+cu121 torchaudio==2.4.0+cu121 \
-    --index-url https://download.pytorch.org/whl/cu121
+# Install only minimal OS packages required at runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates ffmpeg libglib2.0-0 libgl1 libegl1 libxext6 libxrender1 \
+    python3 \
+    && rm -rf /var/lib/apt/lists/*
 
-# 安装稳定版 gsplat
-RUN pip install --no-cache-dir gsplat
+# Copy venv from builder
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
-# ---- 工作目录 ----
+# Copy project source into the image
 WORKDIR /workspace
+COPY . /workspace
 
-# ---- 环境变量（可选优化）----
+WORKDIR /workspace/src
+
+# Optional useful runtime envs
 ENV TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0+PTX" \
     NVIDIA_VISIBLE_DEVICES=all \
-    NVIDIA_DRIVER_CAPABILITIES=all
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
 
-# ---- 默认命令 ----
 CMD ["/bin/bash"]

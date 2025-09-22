@@ -1,0 +1,24 @@
+# Speed up builds by excluding files not needed in image context
+.git
+.gitignore
+*.pyc
+__pycache__
+.pytest_cache
+.mypy_cache
+.venv
+env/
+venv/
+build/
+dist/
+
+# Large or local-only directories
+output/
+images/
+*.png
+*.jpg
+*.jpeg
+*.mp4
+
+# OS cruft
+.DS_Store
+Thumbs.db
