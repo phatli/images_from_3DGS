@@ -126,7 +126,7 @@ OUTDIR_HOST_ABS="$(abs_path "$OUTDIR")"
 if [[ ! -f "$GAUSSIANS_HOST_ABS" ]]; then
   echo "ERROR: gaussians 文件不存在: $GAUSSIANS_HOST_ABS"; exit 1
 fi
-mkdir -p "$OUTDIR_HOST_ABS"
+mkdir -p "$OUTDIR_HOST_ABS" "$OUTDIR_HOST_ABS/rgb" "$OUTDIR_HOST_ABS/depth" "$OUTDIR_HOST_ABS/poses"
 
 if command -v xhost >/dev/null 2>&1; then
   xhost +local:root >/dev/null 2>&1 || true
@@ -146,8 +146,9 @@ python3 manual_plane.py \
     --min_visible $MIN_VISIBLE \
     --overlap_ratio $OVERLAP_RATIO \
     --ds $DS \
-    --img_paths \"$OUTDIR_C\" \
-    --pose_outdir \"$OUTDIR_C\""
+    --img_paths \"$OUTDIR_C/rgb\" \
+    --depth_paths \"$OUTDIR_C/depth\" \
+    --pose_outdir \"$OUTDIR_C/poses\""
 
 # --------------------
 # GPU 预检（防止 CPU 回退）
