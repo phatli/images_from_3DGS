@@ -1,23 +1,28 @@
-# Minimal runtime image for deployment
-FROM nvidia/cuda:12.1.1-runtime-ubuntu22.04
+#################################################################
+# Deploy image (uses CUDA devel base to avoid JIT issues)
+# Mirrors dev image layers to maximize cache/layer sharing.
+#################################################################
+
+FROM nvidia/cuda:12.1.1-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     TZ=Asia/Singapore \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0+PTX"
 
-# Runtime libs + Python
+# Same OS packages as dev to share layers (includes build tools + GL/EGL)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-venv python3-pip \
-    ca-certificates ffmpeg \
-    libglib2.0-0 libgl1 libegl1 libxext6 libxrender1 \
+    python3 python3-venv python3-pip python3-dev \
+    build-essential git vim curl wget cmake ninja-build \
+    ffmpeg libglib2.0-0 libgl1 libegl1 libxext6 libxrender1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Isolated environment
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Python deps actually used by this repo (GPU wheels)
+# Same Python deps order as dev to share layers; includes CUDA-enabled torch and gsplat
 RUN python3 -m pip install --upgrade pip wheel setuptools && \
     pip install --no-cache-dir \
       torch==2.4.0+cu121 \
@@ -31,14 +36,14 @@ RUN python3 -m pip install --upgrade pip wheel setuptools && \
       pyyaml \
       plyfile \
       open3d==0.18.0 \
-      gsplat
+      gsplat \
+      matplotlib
 
-WORKDIR /workspace/src
 # Copy only the source tree used at runtime
+WORKDIR /workspace/src
 COPY src/ /workspace/src/
 
 ENV NVIDIA_VISIBLE_DEVICES=all \
-    NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics \
-    TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0+PTX"
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
 
 CMD ["/bin/bash"]

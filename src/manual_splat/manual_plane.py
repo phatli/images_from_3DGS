@@ -45,6 +45,9 @@ import open3d.visualization.rendering as rendering
 from tqdm import tqdm  
 from render_from_plane import render_and_save_Twc
 from render_depth import render_depth_and_save_Twc
+import threading
+import traceback
+import sys
 
 # ==========================
 # Data structures & utilities
@@ -382,6 +385,10 @@ class App:
         btn_pose.set_on_clicked(self._gen_and_export_poses)
         panel.add_child(btn_pose)
 
+        # Busy indicator
+        self._busy_label = gui.Label("")
+        panel.add_child(self._busy_label)
+
         # Layout & init scene
         self.window.add_child(panel)
         self.window.set_on_layout(self._on_layout)
@@ -497,7 +504,11 @@ class App:
             colors = np.tile(np.array([[1.0, 0.6, 0.0]]), (len(lines), 1))
             line_set.colors = o3d.utility.Vector3dVector(colors)
             mat = rendering.MaterialRecord()
-            mat.shader = "defaultUnlitLine"
+            mat.shader = "unlitLine"
+            try:
+                mat.line_width = 2.0
+            except Exception:
+                pass
             self._add_geom("polyline", line_set, mat)
 
         # Rebuild pick spheres
@@ -648,154 +659,201 @@ class App:
 
     # ---------- Pose generation & export & render image ----------
     def _gen_and_export_poses(self):
-        self.click_generation_num += 1
-        
+        # Run heavy generation + rendering in a background thread to avoid UI freeze
+        if getattr(self, "_is_busy", False):
+            self._notify("Busy", "Processing is already running.")
+            return
         if self.curve_samples is None or self.tck is None:
             self._notify("Hint", "Please fit spline and sample first.")
             return
-        pts_w = self.points
-        center_all = np.mean(pts_w, axis=0)
 
-        n = self.curve_samples.shape[0]
-        us = np.linspace(0, 1, n)
-        tangents = np.array([tangent_on_spline(self.tck, u) for u in us])
+        def worker():
+            try:
+                self.click_generation_num += 1
 
-        poses = []
-        vis_masks = []
-        for i, (p, t2) in enumerate(tqdm(zip(self.curve_samples, tangents),
-                                        total=len(self.curve_samples),
-                                        desc="Generating poses")):
-            fwd = normalize(t2)
-            look = p + np.array([fwd[0], fwd[1], 0.0]) * 2.0
-            look = 0.7 * look + 0.3 * center_all
-            look[2] = look[2] - 0.2
+                # Update UI label to indicate work started
+                def _set_busy(msg: str):
+                    try:
+                        self._busy_label.text = msg
+                    except Exception:
+                        pass
+                gui.Application.instance.post_to_main_thread(self.window, lambda: _set_busy("Working... Generating poses and images..."))
 
-            T_wc = look_at(p, look, up=np.array([0, 0, 1.0]))
-            mask = visible_points_mask(
-                T_wc, self.intr, pts_w, self.near, self.far,
-                fov_h=self.args.fov,
-                fov_v=self.args.fov * (self.args.imgh / self.args.imgw)
-            )
-            poses.append(T_wc)
-            vis_masks.append(mask)
+                pts_w = self.points
+                center_all = np.mean(pts_w, axis=0)
 
-        min_visible = int(self.min_visible_edit.int_value)
-        min_overlap = float(self.overlap_edit.double_value)
-        keep = []
-        last_kept = -1
-        for i in range(n):
-            if vis_masks[i].sum() < min_visible:
-                continue
-            if last_kept >= 0:
-                ov = overlap_ratio(vis_masks[last_kept], vis_masks[i])
-                if ov < min_overlap:
-                    continue
-            keep.append(i)
-            last_kept = i
+                n = self.curve_samples.shape[0]
+                us = np.linspace(0, 1, n)
+                tangents = np.array([tangent_on_spline(self.tck, u) for u in us])
 
-        kept_poses = [poses[i] for i in keep]
-        kept_ids = keep
+                poses = []
+                vis_masks = []
+                for i, (p, t2) in enumerate(zip(self.curve_samples, tangents)):
+                    fwd = normalize(t2)
+                    look = p + np.array([fwd[0], fwd[1], 0.0]) * 2.0
+                    look = 0.7 * look + 0.3 * center_all
+                    look[2] = look[2] - 0.2
 
-        out = {
-            "intrinsics": {
-                "fx": self.intr.fx,
-                "fy": self.intr.fy,
-                "cx": self.intr.cx,
-                "cy": self.intr.cy,
-                "width": self.intr.width,
-                "height": self.intr.height,
-                "fov_deg": self.args.fov,
-                "near": self.near,
-                "far": self.far,
-            },
-            "poses": [
-                {
-                    "id": int(i),
-                    "T_wc": np.asarray(T).reshape(4, 4).tolist(),
-                    "position": np.asarray(T)[:3, 3].tolist(),
+                    T_wc = look_at(p, look, up=np.array([0, 0, 1.0]))
+                    mask = visible_points_mask(
+                        T_wc, self.intr, pts_w, self.near, self.far,
+                        fov_h=self.args.fov,
+                        fov_v=self.args.fov * (self.args.imgh / self.args.imgw)
+                    )
+                    poses.append(T_wc)
+                    vis_masks.append(mask)
+
+                min_visible = int(self.min_visible_edit.int_value)
+                min_overlap = float(self.overlap_edit.double_value)
+                keep = []
+                last_kept = -1
+                for i in range(n):
+                    if vis_masks[i].sum() < min_visible:
+                        continue
+                    if last_kept >= 0:
+                        ov = overlap_ratio(vis_masks[last_kept], vis_masks[i])
+                        if ov < min_overlap:
+                            continue
+                    keep.append(i)
+                    last_kept = i
+
+                kept_poses = [poses[i] for i in keep]
+                kept_ids = keep
+
+                out = {
+                    "intrinsics": {
+                        "fx": self.intr.fx,
+                        "fy": self.intr.fy,
+                        "cx": self.intr.cx,
+                        "cy": self.intr.cy,
+                        "width": self.intr.width,
+                        "height": self.intr.height,
+                        "fov_deg": self.args.fov,
+                        "near": self.near,
+                        "far": self.far,
+                    },
+                    "poses": [
+                        {
+                            "id": int(i),
+                            "T_wc": np.asarray(T).reshape(4, 4).tolist(),
+                            "position": np.asarray(T)[:3, 3].tolist(),
+                        }
+                        for i, T in zip(kept_ids, kept_poses)
+                    ],
+                    "meta": {
+                        "total_samples": int(n),
+                        "kept": len(kept_ids),
+                        "min_visible": int(min_visible),
+                        "min_overlap": float(min_overlap),
+                        "ds": float(self.ds_edit.double_value),
+                    }
                 }
-                for i, T in zip(kept_ids, kept_poses)
-            ],
-            "meta": {
-                "total_samples": int(n),
-                "kept": len(kept_ids),
-                "min_visible": int(min_visible),
-                "min_overlap": float(min_overlap),
-                "ds": float(self.ds_edit.double_value),
-            }
-        }
-        os.makedirs(self.args.pose_outdir, exist_ok=True)
-        json_path = os.path.join(self.args.pose_outdir, f"planned_poses_{self.click_generation_num}.json")
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(out, f, indent=2)
-        
-        self._notify("Exported", f"Saved planned poses to {json_path}\nKept frames: {len(kept_ids)} / {n}")
-        
-        print("Generating rendered images...")
-        
-        os.makedirs(self.args.img_paths, exist_ok=True)
-        os.makedirs(self.args.depth_paths, exist_ok=True)
-        
-        from load_ply import load_gaussians_from_ply
-        scene = load_gaussians_from_ply(self.args.gaussians, device="cuda")
-        for k in scene:
-            scene[k] = scene[k].to("cuda").contiguous().float()
-        
-        import torch
-        opacs  = torch.sigmoid(scene['opacity'].squeeze(-1)) 
-        scales = torch.exp(scene['scale'])
-        
-        # scene['rot'] shape: (N,4)
-        q = scene['rot'].contiguous().float()  # 原始四元数
+                os.makedirs(self.args.pose_outdir, exist_ok=True)
+                json_path = os.path.join(self.args.pose_outdir, f"planned_poses_{self.click_generation_num}.json")
+                with open(json_path, "w", encoding="utf-8") as f:
+                    json.dump(out, f, indent=2)
 
-        # ----- 自检顺序（启发式）：如果第4列均值绝对值最大，说明可能是 xyzw，需要重排到 wxyz -----
-        with torch.no_grad():
-            col_abs_mean = q.abs().mean(dim=0)           # (4,)
-            likely_xyzw = col_abs_mean[-1] > col_abs_mean[:-1].max()  # 第4列最大 → 怀疑是 w 在最后
-        if likely_xyzw:
-            q = q[:, [3, 0, 1, 2]]   # xyzw -> wxyz
+                gui.Application.instance.post_to_main_thread(
+                    self.window,
+                    lambda: self._notify("Exported", f"Saved planned poses to {json_path}\nKept frames: {len(kept_ids)} / {n}")
+                )
 
-        # 必须归一化（防数值漂移）
-        q = q / q.norm(dim=1, keepdim=True).clamp_min(1e-8)
-        
-        model = {
-            "means": scene['xyz'],         # (N,3)
-            "quats": q,        # (N,4)
-            "scales": scales,       # (N,3)
-            "opacities": opacs,     # (N,)
-            "colors": scene['rgb']        # (N,3) in [0,1]
-        }
+                print("Generating rendered images...")
+                sys.stdout.flush()
 
-        HFOV = math.radians(self.args.fov)
-        fx = fy = self.args.imgw / (2*math.tan(HFOV/2))
-        cx, cy = self.args.imgw/2.0, self.args.imgh/2.0
+                os.makedirs(self.args.img_paths, exist_ok=True)
+                os.makedirs(self.args.depth_paths, exist_ok=True)
 
-        K_torch = torch.tensor([[fx, 0, cx],
-                        [0, fy, cy],
-                        [0,  0,  1]], dtype=torch.float32, device="cuda").unsqueeze(0)  # (1,3,3)
+                from load_ply import load_gaussians_from_ply
+                scene = load_gaussians_from_ply(self.args.gaussians, device="cuda")
+                for k in scene:
+                    scene[k] = scene[k].to("cuda").contiguous().float()
 
-        K = K_torch.cpu().numpy()[0]
-        intr = {"K": K, "width": self.args.imgw, "height": self.args.imgh}
-        img_paths = [os.path.join(self.args.img_paths + '/' + str(self.click_generation_num), f"frame_{i:04d}.png") for i in range(len(kept_poses))]
+                import torch
+                opacs  = torch.sigmoid(scene['opacity'].squeeze(-1)) 
+                scales = torch.exp(scene['scale'])
 
-        saved_paths = render_and_save_Twc(
-            poses_Twc=kept_poses,    # List[np.ndarray(4,4)]
-            img_paths=img_paths,
-            model=model,
-            intrinsics=intr,
-            device="cuda"
-        )
+                # scene['rot'] shape: (N,4)
+                q = scene['rot'].contiguous().float()  # 原始四元数
 
-        depth_paths = [os.path.join(self.args.depth_paths + '/' + str(self.click_generation_num), f"frame_{i:04d}.png") for i in range(len(kept_poses))]
+                # ----- 自检顺序（启发式）：如果第4列均值绝对值最大，说明可能是 xyzw，需要重排到 wxyz -----
+                with torch.no_grad():
+                    col_abs_mean = q.abs().mean(dim=0)           # (4,)
+                    likely_xyzw = col_abs_mean[-1] > col_abs_mean[:-1].max()  # 第4列最大 → 怀疑是 w 在最后
+                if likely_xyzw:
+                    q = q[:, [3, 0, 1, 2]]   # xyzw -> wxyz
 
-        saved_depth_paths = render_depth_and_save_Twc(
-            poses_Twc=kept_poses,
-            img_paths=depth_paths,
-            model=model,
-            intrinsics=intr,
-            device="cuda",
-            depth_scale=1000.0           # 米->毫米
-        )
+                # 必须归一化（防数值漂移）
+                q = q / q.norm(dim=1, keepdim=True).clamp_min(1e-8)
+
+                model = {
+                    "means": scene['xyz'],         # (N,3)
+                    "quats": q,        # (N,4)
+                    "scales": scales,       # (N,3)
+                    "opacities": opacs,     # (N,)
+                    "colors": scene['rgb']        # (N,3) in [0,1]
+                }
+
+                HFOV = math.radians(self.args.fov)
+                fx = fy = self.args.imgw / (2*math.tan(HFOV/2))
+                cx, cy = self.args.imgw/2.0, self.args.imgh/2.0
+
+                # 用 numpy K（render_* 接口会再转 tensor），无需先放 GPU
+                K = np.array([[fx, 0, cx],
+                              [0, fy, cy],
+                              [0,  0,  1]], dtype=np.float32)
+                intr = {"K": K, "width": self.args.imgw, "height": self.args.imgh}
+                img_paths = [os.path.join(self.args.img_paths + '/' + str(self.click_generation_num), f"frame_{i:04d}.png") for i in range(len(kept_poses))]
+
+                # 渲染彩色
+                saved_paths = render_and_save_Twc(
+                    poses_Twc=kept_poses,    # List[np.ndarray(4,4)]
+                    img_paths=img_paths,
+                    model=model,
+                    intrinsics=intr,
+                    device="cuda"
+                )
+                try:
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
+
+                # 渲染深度
+                depth_paths = [os.path.join(self.args.depth_paths + '/' + str(self.click_generation_num), f"frame_{i:04d}.png") for i in range(len(kept_poses))]
+                saved_depth_paths = render_depth_and_save_Twc(
+                    poses_Twc=kept_poses,
+                    img_paths=depth_paths,
+                    model=model,
+                    intrinsics=intr,
+                    device="cuda",
+                    depth_scale=1000.0           # 米->毫米
+                )
+                try:
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
+
+                msg = (f"Rendered {len(saved_paths)} RGB and {len(saved_depth_paths)} depth images\n"
+                       f"to {self.args.img_paths}/{self.click_generation_num} and {self.args.depth_paths}/{self.click_generation_num}.")
+                gui.Application.instance.post_to_main_thread(self.window, lambda: self._notify("Done", msg))
+
+            except Exception as e:
+                tb = traceback.format_exc()
+                print(tb, file=sys.stderr)
+                sys.stderr.flush()
+                _msg = str(e)
+                gui.Application.instance.post_to_main_thread(self.window, lambda m=_msg: self._notify("Error", m))
+            finally:
+                def _clear_busy():
+                    try:
+                        self._busy_label.text = ""
+                        self._is_busy = False
+                    except Exception:
+                        pass
+                gui.Application.instance.post_to_main_thread(self.window, _clear_busy)
+
+        self._is_busy = True
+        threading.Thread(target=worker, daemon=True).start()
 
 # ==========================
 # Entry
