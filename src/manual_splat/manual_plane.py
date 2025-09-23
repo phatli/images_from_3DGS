@@ -385,7 +385,16 @@ class App:
         btn_pose.set_on_clicked(self._gen_and_export_poses)
         panel.add_child(btn_pose)
 
-        # Busy indicator
+        # Guidance (consolidated text to avoid overlap)
+        guide_text = (
+            "How to use:\n"
+            "1) Hold Shift + Left Click on the green plane to add points (in order).\n"
+            "2) Click 'Fit spline & sample' to generate samples.\n"
+            "3) Click 'Generate poses...' to export JSON and render images."
+        )
+        panel.add_child(gui.Label(guide_text))
+
+        # Busy/status indicator (blank until used)
         self._busy_label = gui.Label("")
         panel.add_child(self._busy_label)
 
@@ -495,7 +504,9 @@ class App:
             self.scene.remove_geometry("polyline")
 
         if len(self.picked_xy) >= 2:
-            pts3d = np.array([[x, y, self.plane_z] for x, y in self.picked_xy])
+            # Slightly raise the polyline above the plane to avoid z-fighting
+            z_eps = 1e-3
+            pts3d = np.array([[x, y, self.plane_z + z_eps] for x, y in self.picked_xy])
             lines = np.stack([np.arange(len(pts3d)-1), np.arange(1, len(pts3d))], axis=1)
             line_set = o3d.geometry.LineSet(
                 points=o3d.utility.Vector3dVector(pts3d),
@@ -506,7 +517,7 @@ class App:
             mat = rendering.MaterialRecord()
             mat.shader = "unlitLine"
             try:
-                mat.line_width = 2.0
+                mat.line_width = 4.0
             except Exception:
                 pass
             self._add_geom("polyline", line_set, mat)
@@ -720,46 +731,14 @@ class App:
                 kept_poses = [poses[i] for i in keep]
                 kept_ids = keep
 
-                out = {
-                    "intrinsics": {
-                        "fx": self.intr.fx,
-                        "fy": self.intr.fy,
-                        "cx": self.intr.cx,
-                        "cy": self.intr.cy,
-                        "width": self.intr.width,
-                        "height": self.intr.height,
-                        "fov_deg": self.args.fov,
-                        "near": self.near,
-                        "far": self.far,
-                    },
-                    "poses": [
-                        {
-                            "id": int(i),
-                            "T_wc": np.asarray(T).reshape(4, 4).tolist(),
-                            "position": np.asarray(T)[:3, 3].tolist(),
-                        }
-                        for i, T in zip(kept_ids, kept_poses)
-                    ],
-                    "meta": {
-                        "total_samples": int(n),
-                        "kept": len(kept_ids),
-                        "min_visible": int(min_visible),
-                        "min_overlap": float(min_overlap),
-                        "ds": float(self.ds_edit.double_value),
-                    }
-                }
-                os.makedirs(self.args.pose_outdir, exist_ok=True)
-                json_path = os.path.join(self.args.pose_outdir, f"planned_poses_{self.click_generation_num}.json")
-                with open(json_path, "w", encoding="utf-8") as f:
-                    json.dump(out, f, indent=2)
-
-                gui.Application.instance.post_to_main_thread(
-                    self.window,
-                    lambda: self._notify("Exported", f"Saved planned poses to {json_path}\nKept frames: {len(kept_ids)} / {n}")
-                )
-
                 print("Generating rendered images...")
                 sys.stdout.flush()
+                def _set_busy(msg: str):
+                    try:
+                        self._busy_label.text = msg
+                    except Exception:
+                        pass
+                gui.Application.instance.post_to_main_thread(self.window, lambda: _set_busy("Rendering RGB 0/%d" % (len(kept_poses),)))
 
                 os.makedirs(self.args.img_paths, exist_ok=True)
                 os.makedirs(self.args.depth_paths, exist_ok=True)
@@ -803,39 +782,136 @@ class App:
                               [0, fy, cy],
                               [0,  0,  1]], dtype=np.float32)
                 intr = {"K": K, "width": self.args.imgw, "height": self.args.imgh}
-                img_paths = [os.path.join(self.args.img_paths + '/' + str(self.click_generation_num), f"frame_{i:04d}.png") for i in range(len(kept_poses))]
+                # Build output paths
+                img_dir = os.path.join(self.args.img_paths, str(self.click_generation_num))
+                depth_dir = os.path.join(self.args.depth_paths, str(self.click_generation_num))
+                os.makedirs(img_dir, exist_ok=True)
+                os.makedirs(depth_dir, exist_ok=True)
+                img_paths = [os.path.join(img_dir, f"frame_{i:04d}.png") for i in range(len(kept_poses))]
+                depth_paths = [os.path.join(depth_dir, f"frame_{i:04d}.png") for i in range(len(kept_poses))]
 
-                # 渲染彩色
-                saved_paths = render_and_save_Twc(
-                    poses_Twc=kept_poses,    # List[np.ndarray(4,4)]
-                    img_paths=img_paths,
-                    model=model,
-                    intrinsics=intr,
-                    device="cuda"
-                )
+                # Render RGB strictly per-frame with real-time progress updates
+                rgb_success_ids = []
+                for idx, (pose, path) in enumerate(zip(kept_poses, img_paths)):
+                    gui.Application.instance.post_to_main_thread(
+                        self.window,
+                        lambda i=idx, N=len(kept_poses): _set_busy(f"Rendering RGB {i+1}/{N}")
+                    )
+                    try:
+                        render_and_save_Twc([pose], [path], model, intr, device="cuda")
+                        rgb_success_ids.append(idx)
+                    except Exception as _e:
+                        print(f"[RGB] failed at {idx}: {_e}")
                 try:
                     torch.cuda.synchronize()
                 except Exception:
                     pass
 
-                # 渲染深度
-                depth_paths = [os.path.join(self.args.depth_paths + '/' + str(self.click_generation_num), f"frame_{i:04d}.png") for i in range(len(kept_poses))]
-                saved_depth_paths = render_depth_and_save_Twc(
-                    poses_Twc=kept_poses,
-                    img_paths=depth_paths,
-                    model=model,
-                    intrinsics=intr,
-                    device="cuda",
-                    depth_scale=1000.0           # 米->毫米
-                )
+                # Render Depth strictly per-frame for frames with successful RGB
+                depth_success_ids = []
+                for j, i in enumerate(rgb_success_ids):
+                    gui.Application.instance.post_to_main_thread(
+                        self.window,
+                        lambda k=j, N=len(rgb_success_ids): _set_busy(f"Rendering Depth {k+1}/{N}")
+                    )
+                    try:
+                        render_depth_and_save_Twc([kept_poses[i]], [depth_paths[i]], model, intr, device="cuda", depth_scale=1000.0)
+                        depth_success_ids.append(i)
+                    except Exception as _e:
+                        print(f"[Depth] failed at {i}: {_e}")
                 try:
                     torch.cuda.synchronize()
                 except Exception:
                     pass
 
-                msg = (f"Rendered {len(saved_paths)} RGB and {len(saved_depth_paths)} depth images\n"
-                       f"to {self.args.img_paths}/{self.click_generation_num} and {self.args.depth_paths}/{self.click_generation_num}.")
-                gui.Application.instance.post_to_main_thread(self.window, lambda: self._notify("Done", msg))
+                # Final set of frames we consider successfully rendered (use RGB success as ground truth)
+                final_ids = rgb_success_ids
+
+                # Compose JSON only with successfully rendered frames to guarantee 1:1
+                out = {
+                    "intrinsics": {
+                        "fx": self.intr.fx,
+                        "fy": self.intr.fy,
+                        "cx": self.intr.cx,
+                        "cy": self.intr.cy,
+                        "width": self.intr.width,
+                        "height": self.intr.height,
+                        "fov_deg": self.args.fov,
+                        "near": self.near,
+                        "far": self.far,
+                    },
+                    "poses": [
+                        {
+                            "id": int(kept_ids[i]),
+                            "T_wc": np.asarray(kept_poses[i]).reshape(4, 4).tolist(),
+                            "position": np.asarray(kept_poses[i])[:3, 3].tolist(),
+                        }
+                        for i in final_ids
+                    ],
+                    "meta": {
+                        "total_samples": int(n),
+                        "kept": len(kept_ids),
+                        "rendered_rgb": len(final_ids),
+                        "rendered_depth": int(len(set(final_ids) & set(depth_success_ids))),
+                        "min_visible": int(min_visible),
+                        "min_overlap": float(min_overlap),
+                        "ds": float(self.ds_edit.double_value),
+                        "click_generation": int(self.click_generation_num),
+                    }
+                }
+                os.makedirs(self.args.pose_outdir, exist_ok=True)
+                json_path = os.path.join(self.args.pose_outdir, f"planned_poses_{self.click_generation_num}.json")
+                with open(json_path, "w", encoding="utf-8") as f:
+                    json.dump(out, f, indent=2)
+
+                # Cleanup pass: remove unexpected files not listed as successful
+                removed_rgb = 0
+                removed_depth = 0
+                try:
+                    keep_rgb = set(final_ids)
+                    for fname in os.listdir(img_dir):
+                        if not (fname.startswith("frame_") and fname.endswith(".png")):
+                            continue
+                        try:
+                            idx = int(os.path.splitext(fname)[0].split("_")[1])
+                        except Exception:
+                            continue
+                        if idx not in keep_rgb:
+                            try:
+                                os.remove(os.path.join(img_dir, fname))
+                                removed_rgb += 1
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+                try:
+                    keep_depth = set(depth_success_ids)
+                    for fname in os.listdir(depth_dir):
+                        if not (fname.startswith("frame_") and fname.endswith(".png")):
+                            continue
+                        try:
+                            idx = int(os.path.splitext(fname)[0].split("_")[1])
+                        except Exception:
+                            continue
+                        if idx not in keep_depth:
+                            try:
+                                os.remove(os.path.join(depth_dir, fname))
+                                removed_depth += 1
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+                summary = (
+                    f"Kept frames: {len(kept_ids)}/{n}. "
+                    f"Rendered RGB: {len(final_ids)}/{len(kept_ids)}. "
+                    f"Rendered Depth: {len(set(final_ids) & set(depth_success_ids))}/{len(final_ids)}.\n"
+                    f"Cleaned extras -> RGB: {removed_rgb}, Depth: {removed_depth}.\n"
+                    f"JSON: {json_path}\n"
+                    f"RGB dir: {img_dir}\nDepth dir: {depth_dir}"
+                )
+                gui.Application.instance.post_to_main_thread(self.window, lambda: self._notify("Done", summary))
 
             except Exception as e:
                 tb = traceback.format_exc()
