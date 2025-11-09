@@ -242,17 +242,18 @@ def render_depth_and_save_rt(
     mdl = _ensure_model_tensors(model, device)
     K_torch, W, H = _make_K_tensor(intrinsics, device)
 
+    poses_rt = list(poses_rt)
+    img_paths = list(img_paths)
+    if len(poses_rt) != len(img_paths):
+        raise ValueError("poses_rt 和 img_paths 数量不匹配")
+
     saved: List[str] = []
     printed_once = False
 
-    for (R, t), path in zip(poses_rt, img_paths):
-        # 为当前帧构造 viewmat
-        viewmats = _rt_to_viewmat(R, t, device)  # (1,4,4)
+    for idx, ((R, t), path) in enumerate(zip(poses_rt, img_paths)):
+        viewmats = _rt_to_viewmat(R, t, device)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
 
-        depth_tensor = None
-        last_imgs = last_meta_img = last_meta = None
-
-        # # 1) 优先尝试 RGBD（第4通道是深度）
         try:
             imgs, meta_img, meta = gs.rasterization(
                 means=mdl["means"], quats=mdl["quats"], scales=mdl["scales"],
@@ -260,16 +261,15 @@ def render_depth_and_save_rt(
                 viewmats=viewmats, Ks=K_torch, width=W, height=H,
                 render_mode="D", rasterize_mode=rasterize_mode, radius_clip=radius_clip
             )
-            if not printed_once:
-                _debug_print_render_outputs(imgs, meta_img, meta, tag="[RGBD]")
-                printed_once = True
-            depth_tensor = _extract_depth(imgs, meta_img, meta, prefer_key=None, allow_meta_img=True)
-        except Exception:
-            last_imgs, last_meta_img, last_meta = (locals().get("imgs"), locals().get("meta_img"), locals().get("meta"))
-            depth_tensor = None
+        except Exception as err:
+            raise RuntimeError(f"Depth rasterization failed at frame {idx} ({path}): {err}") from err
 
-        # 保存
-        depth = depth_tensor.detach().cpu().numpy()  # (H,W) float32，默认按“米”处理
+        if not printed_once:
+            _debug_print_render_outputs(imgs, meta_img, meta, tag="[RGBD]")
+            printed_once = True
+
+        depth_tensor = _extract_depth(imgs, meta_img, meta, prefer_key=None, allow_meta_img=True)
+        depth = depth_tensor.detach().cpu().numpy()
         _save_depth(path, depth, depth_format=depth_format, depth_scale=depth_scale)
         saved.append(path)
         print(f"[depth_render] Saved depth: {path}")

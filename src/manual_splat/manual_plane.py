@@ -32,8 +32,9 @@ import argparse
 import json
 import math
 import os
+import time
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Tuple, Optional, Dict, Any
 
 import numpy as np
 from scipy.interpolate import splprep, splev
@@ -42,12 +43,75 @@ import open3d as o3d
 import open3d.visualization.gui as gui
 import open3d.visualization.rendering as rendering
 
-from tqdm import tqdm  
 from render_from_plane import render_and_save_Twc
 from render_depth import render_depth_and_save_Twc
 import threading
 import traceback
 import sys
+
+import imageio.v2 as imageio
+
+
+class CancelledError(RuntimeError):
+    """Raised when the user requests cancellation."""
+
+
+class StructuredLogger:
+    """Minimal structured logger writing JSON lines for external parsers."""
+
+    def __init__(self, name: str = "dataset"):
+        self._name = name
+
+    def log(self, event: str, **fields: Any):
+        payload: Dict[str, Any] = {"ts": time.time(), "event": event, **fields}
+        try:
+            body = json.dumps(payload, ensure_ascii=False, default=str)
+        except TypeError:
+            safe_payload = {k: str(v) for k, v in payload.items()}
+            body = json.dumps(safe_payload, ensure_ascii=False)
+        print(f"[{self._name}] {body}", flush=True)
+
+
+class ProgressReporter:
+    """Helper to throttle log spam while emitting progress updates."""
+
+    def __init__(self, logger: StructuredLogger, phase: str, total: int, min_interval: float = 0.5):
+        self.logger = logger
+        self.phase = phase
+        self.total = max(1, int(total))
+        self.completed = 0
+        self.min_interval = max(0.1, float(min_interval))
+        self._last_emit = 0.0
+        self.logger.log("phase_start", phase=self.phase, total=self.total)
+
+    def update(self, step: int = 1, detail: Optional[Dict[str, Any]] = None):
+        self.completed = min(self.total, self.completed + int(step))
+        now = time.time()
+        if now - self._last_emit >= self.min_interval or self.completed == self.total:
+            payload: Dict[str, Any] = {
+                "phase": self.phase,
+                "completed": self.completed,
+                "total": self.total,
+            }
+            if detail is not None:
+                payload["detail"] = detail
+            self.logger.log("phase_progress", **payload)
+            self._last_emit = now
+
+    def finish(self, detail: Optional[Dict[str, Any]] = None):
+        payload: Dict[str, Any] = {"phase": self.phase, "total": self.total}
+        if detail is not None:
+            payload["detail"] = detail
+        self.completed = self.total
+        self.logger.log("phase_complete", **payload)
+
+
+@dataclass
+class ResourceLimits:
+    visibility_chunk: int
+    max_route_samples: int
+    render_batch_size: int
+    progress_interval: float
 
 # ==========================
 # Data structures & utilities
@@ -105,6 +169,32 @@ def world_to_camera(T_wc: np.ndarray, pts_w: np.ndarray) -> np.ndarray:
     R = T_wc[:3, :3]
     t = T_wc[:3, 3]
     return (pts_w - t) @ R  # (N,3)
+
+
+def orientation_offsets(count: int, span_deg: float) -> np.ndarray:
+    count = max(1, int(count))
+    span = max(0.0, float(span_deg))
+    if count == 1 or span == 0.0:
+        return np.zeros(count, dtype=np.float32)
+    half = span / 2.0
+    if count == 2:
+        return np.array([-half, half], dtype=np.float32)
+    return np.linspace(-half, half, count, dtype=np.float32)
+
+
+def rotate_xy(vec: np.ndarray, yaw_deg: float) -> np.ndarray:
+    v = np.asarray(vec, dtype=np.float32)
+    if v.shape[0] != 2:
+        raise ValueError("vec must be 2D")
+    norm = np.linalg.norm(v)
+    if norm < 1e-6:
+        v = np.array([1.0, 0.0], dtype=np.float32)
+        norm = 1.0
+    v = v / norm
+    rad = math.radians(yaw_deg)
+    c, s = math.cos(rad), math.sin(rad)
+    rot = np.array([v[0] * c - v[1] * s, v[0] * s + v[1] * c], dtype=np.float32)
+    return rot
 
 
 # ==========================
@@ -255,6 +345,39 @@ def visible_points_mask(T_wc: np.ndarray, intr: CameraIntrinsics, pts_w: np.ndar
     return mask
 
 
+def visible_point_indices_chunked(T_wc: np.ndarray, intr: CameraIntrinsics, pts_w: np.ndarray,
+                                  near: float, far: float, fov_h: float, fov_v: float,
+                                  chunk_size: int) -> np.ndarray:
+    total = pts_w.shape[0]
+    if total == 0:
+        return np.empty(0, dtype=np.int64)
+    if chunk_size <= 0 or chunk_size >= total:
+        mask = visible_points_mask(T_wc, intr, pts_w, near, far, fov_h, fov_v)
+        return np.flatnonzero(mask)
+
+    indices: List[np.ndarray] = []
+    chunk_size = max(1, int(chunk_size))
+    for start in range(0, total, chunk_size):
+        end = min(total, start + chunk_size)
+        chunk = pts_w[start:end]
+        mask = visible_points_mask(T_wc, intr, chunk, near, far, fov_h, fov_v)
+        if np.any(mask):
+            local_idx = np.flatnonzero(mask).astype(np.int64, copy=False)
+            indices.append(local_idx + start)
+
+    if not indices:
+        return np.empty(0, dtype=np.int64)
+    return np.concatenate(indices, axis=0)
+
+
+def overlap_ratio_indices(idx_a: np.ndarray, idx_b: np.ndarray) -> float:
+    if idx_a.size == 0 and idx_b.size == 0:
+        return 0.0
+    inter = np.intersect1d(idx_a, idx_b, assume_unique=False)
+    union = idx_a.size + idx_b.size - inter.size
+    return float(inter.size) / float(max(1, union))
+
+
 def overlap_ratio(idx_a: np.ndarray, idx_b: np.ndarray) -> float:
     a = set(np.where(idx_a)[0].tolist())
     b = set(np.where(idx_b)[0].tolist())
@@ -272,11 +395,23 @@ def overlap_ratio(idx_a: np.ndarray, idx_b: np.ndarray) -> float:
 class App:
     def __init__(self, args):
         self.args = args
+        self.logger = StructuredLogger("dataset")
+        self._cancel_event = threading.Event()
         self.means, self.scales, self.colors = load_gaussians(args.gaussians, default_scale=args.default_scale)
         self.points = self.means  # only centers for planning
         self.intr = CameraIntrinsics.from_fov(args.imgw, args.imgh, args.fov)
         self.near = args.near
         self.far = args.far
+
+        self.limits = ResourceLimits(
+            visibility_chunk=max(1, int(getattr(args, "visibility_chunk", 500_000))),
+            max_route_samples=int(getattr(args, "max_route_samples", 4000)),
+            render_batch_size=max(1, int(getattr(args, "render_batch_size", 4))),
+            progress_interval=max(0.1, float(getattr(args, "progress_interval_sec", 0.5))),
+        )
+
+        self._enforce_gaussian_limit()
+        self.logger.log("gaussians_loaded", count=int(self.points.shape[0]))
 
         # GUI state
         self.plane_z = float(np.median(self.points[:, 2]))
@@ -301,6 +436,35 @@ class App:
 
         self.click_generation_num = 0
         self._build_ui()
+
+    def _enforce_gaussian_limit(self):
+        limit = int(getattr(self.args, "max_gaussians", 0))
+        total = int(self.points.shape[0])
+        if limit <= 0 or total <= limit:
+            return
+
+        msg = (
+            f"Gaussian count {total} exceeds configured limit {limit}. "
+            "Enable --allow-gaussian-downsample or raise --max-gaussians to continue."
+        )
+        if getattr(self.args, "allow_gaussian_downsample", False):
+            idx = np.linspace(0, total - 1, limit, dtype=np.int64)
+            self.means = self.means[idx]
+            self.points = self.means
+            if self.scales is not None:
+                self.scales = self.scales[idx]
+            if self.colors is not None:
+                self.colors = self.colors[idx]
+            self.logger.log(
+                "gaussians_downsampled",
+                original=total,
+                kept=limit,
+                strategy="linspace",
+            )
+            return
+
+        self.logger.log("gaussian_limit_exceeded", original=total, limit=limit)
+        raise RuntimeError(msg)
 
     # ---------- Geometry name bookkeeping ----------
     def _add_geom(self, name, geom, material=None, group=None):
@@ -366,10 +530,53 @@ class App:
         panel.add_child(gui.Label("Path sample spacing ds (m)"))
         panel.add_child(self.ds_edit)
 
+        self.orientation_count_edit = gui.NumberEdit(gui.NumberEdit.INT)
+        self.orientation_count_edit.set_value(getattr(self.args, "orientations_per_point", 1))
+        panel.add_child(gui.Label("Orientations per waypoint"))
+        panel.add_child(self.orientation_count_edit)
+
+        self.orientation_span_edit = gui.NumberEdit(gui.NumberEdit.DOUBLE)
+        self.orientation_span_edit.set_value(getattr(self.args, "orientation_span_deg", 0.0))
+        panel.add_child(gui.Label("Orientation span (deg)"))
+        panel.add_child(self.orientation_span_edit)
+
+        self.pitch_offset_edit = gui.NumberEdit(gui.NumberEdit.DOUBLE)
+        self.pitch_offset_edit.set_value(getattr(self.args, "pitch_offset_deg", -10.0))
+        panel.add_child(gui.Label("Pitch offset (deg, down = negative)"))
+        panel.add_child(self.pitch_offset_edit)
+
         self.overlap_edit = gui.NumberEdit(gui.NumberEdit.DOUBLE)
         self.overlap_edit.set_value(self.args.overlap_ratio)
         panel.add_child(gui.Label("Overlap threshold [0,1]"))
         panel.add_child(self.overlap_edit)
+
+        self.coverage_checkbox = gui.Checkbox("Coverage priority (prefer new coverage)")
+        self.coverage_checkbox.checked = bool(getattr(self.args, "coverage_priority", True))
+        self.coverage_checkbox.set_on_checked(self._on_coverage_toggled)
+        panel.add_child(self.coverage_checkbox)
+
+        self.min_new_visible_edit = gui.NumberEdit(gui.NumberEdit.INT)
+        self.min_new_visible_edit.set_value(int(getattr(self.args, "min_new_visible", 200)))
+        panel.add_child(gui.Label("Min new Gaussians per kept frame"))
+        panel.add_child(self.min_new_visible_edit)
+
+        self.enforce_overlap_checkbox = gui.Checkbox("Require overlap continuity")
+        self.enforce_overlap_checkbox.checked = bool(getattr(self.args, "enforce_overlap", False))
+        panel.add_child(self.enforce_overlap_checkbox)
+
+        self._on_coverage_toggled(self.coverage_checkbox.checked)
+
+        self.audit_checkbox = gui.Checkbox("Audit rendered image quality")
+        self.audit_checkbox.checked = bool(getattr(self.args, "audit_images", True))
+        self.audit_checkbox.set_on_checked(self._on_audit_toggled)
+        panel.add_child(self.audit_checkbox)
+
+        self.audit_rate_edit = gui.NumberEdit(gui.NumberEdit.DOUBLE)
+        self.audit_rate_edit.set_value(float(getattr(self.args, "audit_sample_rate", 0.5)))
+        panel.add_child(gui.Label("Audit sample rate 0-1"))
+        panel.add_child(self.audit_rate_edit)
+
+        self._on_audit_toggled(self.audit_checkbox.checked)
 
         self.min_visible_edit = gui.NumberEdit(gui.NumberEdit.INT)
         self.min_visible_edit.set_value(self.args.min_visible)
@@ -384,6 +591,10 @@ class App:
         btn_pose = gui.Button("Generate poses & export JSON & render images")
         btn_pose.set_on_clicked(self._gen_and_export_poses)
         panel.add_child(btn_pose)
+
+        btn_cancel = gui.Button("Cancel active job")
+        btn_cancel.set_on_clicked(self._cancel_active_job)
+        panel.add_child(btn_cancel)
 
         # Guidance (consolidated text to avoid overlap)
         guide_text = (
@@ -477,7 +688,7 @@ class App:
 
         mat = rendering.MaterialRecord()
         mat.shader = "defaultUnlit"
-        mat.base_color = (0.2, 0.3, 0.75, 0.5)
+        mat.base_color = (0.2, 0.3, 0.75, 0.18)
         self._add_geom("plane", self.plane, mat)
 
         # 保留或移除都行：更新平面时是否清空选点
@@ -486,6 +697,18 @@ class App:
     def _on_z_changed(self, val):
         # Only update value; geometry updates when pressing the button
         pass
+
+    def _on_coverage_toggled(self, checked: bool):
+        try:
+            self.min_new_visible_edit.enabled = bool(checked)
+        except Exception:
+            pass
+
+    def _on_audit_toggled(self, checked: bool):
+        try:
+            self.audit_rate_edit.enabled = bool(checked)
+        except Exception:
+            pass
 
     def _undo_point(self):
         if len(self.picked_xy) > 0:
@@ -646,6 +869,19 @@ class App:
         # 最后实在不行就打印
         print(f"[{title}] {text}")
 
+    def _cancel_active_job(self):
+        if getattr(self, "_is_busy", False):
+            self._cancel_event.set()
+            self.logger.log("cancel_requested", generation=self.click_generation_num)
+            try:
+                self._busy_label.text = "Cancelling..."
+            except Exception:
+                pass
+
+    def _check_cancel(self):
+        if self._cancel_event.is_set():
+            raise CancelledError("Operation cancelled by user.")
+
     # ---------- Fit & sample ----------
     def _fit_and_sample(self):
         if len(self.picked_xy) < 2:
@@ -655,7 +891,30 @@ class App:
         self.tck, L = fit_spline_2d(xy, smooth=0.0)
         ds = float(self.ds_edit.double_value)
         samples_xy = sample_spline(self.tck, L, ds)
-        self.curve_samples = np.concatenate([samples_xy, np.full((samples_xy.shape[0], 1), self.plane_z)], axis=1)
+        samples_xyz = np.concatenate([samples_xy, np.full((samples_xy.shape[0], 1), self.plane_z)], axis=1)
+
+        limit = int(self.limits.max_route_samples)
+        original_samples = samples_xyz.shape[0]
+        if limit > 0 and original_samples > limit:
+            if getattr(self.args, "auto_downsample_route", False):
+                stride = max(1, int(math.ceil(original_samples / limit)))
+                samples_xyz = samples_xyz[::stride]
+                self.logger.log(
+                    "route_downsampled",
+                    original=original_samples,
+                    kept=int(samples_xyz.shape[0]),
+                    stride=stride,
+                )
+            else:
+                msg = (
+                    f"Sample count {original_samples} exceeds limit {limit}. "
+                    "Increase --max-route-samples or enable --auto-downsample-route."
+                )
+                self.logger.log("route_limit_exceeded", original=original_samples, limit=limit)
+                self._notify("Route too dense", msg)
+                return
+
+        self.curve_samples = samples_xyz
 
         # Visualize samples
         self._clear_group("samples")
@@ -679,153 +938,292 @@ class App:
             return
 
         def worker():
+            torch_mod = None
             try:
                 self.click_generation_num += 1
+                generation_id = self.click_generation_num
+                self._cancel_event.clear()
+                self.logger.log("job_start", generation=generation_id)
 
-                # Update UI label to indicate work started
                 def _set_busy(msg: str):
                     try:
                         self._busy_label.text = msg
                     except Exception:
                         pass
-                gui.Application.instance.post_to_main_thread(self.window, lambda: _set_busy("Working... Generating poses and images..."))
+
+                def _post_busy(msg: str):
+                    gui.Application.instance.post_to_main_thread(self.window, lambda: _set_busy(msg))
+
+                _post_busy("Preparing poses and renderer...")
 
                 pts_w = self.points
                 center_all = np.mean(pts_w, axis=0)
-
                 n = self.curve_samples.shape[0]
                 us = np.linspace(0, 1, n)
-                tangents = np.array([tangent_on_spline(self.tck, u) for u in us])
-
-                poses = []
-                vis_masks = []
-                for i, (p, t2) in enumerate(zip(self.curve_samples, tangents)):
-                    fwd = normalize(t2)
-                    look = p + np.array([fwd[0], fwd[1], 0.0]) * 2.0
-                    look = 0.7 * look + 0.3 * center_all
-                    look[2] = look[2] - 0.2
-
-                    T_wc = look_at(p, look, up=np.array([0, 0, 1.0]))
-                    mask = visible_points_mask(
-                        T_wc, self.intr, pts_w, self.near, self.far,
-                        fov_h=self.args.fov,
-                        fov_v=self.args.fov * (self.args.imgh / self.args.imgw)
-                    )
-                    poses.append(T_wc)
-                    vis_masks.append(mask)
-
                 min_visible = int(self.min_visible_edit.int_value)
                 min_overlap = float(self.overlap_edit.double_value)
-                keep = []
-                last_kept = -1
-                for i in range(n):
-                    if vis_masks[i].sum() < min_visible:
-                        continue
-                    if last_kept >= 0:
-                        ov = overlap_ratio(vis_masks[last_kept], vis_masks[i])
-                        if ov < min_overlap:
+                coverage_priority = bool(getattr(self.coverage_checkbox, "checked", True))
+                min_new_visible = max(0, int(self.min_new_visible_edit.int_value))
+                require_overlap = bool(getattr(self.enforce_overlap_checkbox, "checked", False))
+                orientation_count = max(2, int(self.orientation_count_edit.int_value))
+                orientation_span = float(self.orientation_span_edit.double_value)
+                pitch_offset = float(self.pitch_offset_edit.double_value)
+                yaw_offsets = orientation_offsets(orientation_count, orientation_span)
+                audit_images = bool(getattr(self.audit_checkbox, "checked", True))
+                audit_sample_rate = float(np.clip(self.audit_rate_edit.double_value, 0.0, 1.0))
+                kept_poses: List[np.ndarray] = []
+                kept_meta: List[Dict[str, Any]] = []
+                last_visible_idx: Optional[np.ndarray] = None
+                covered_mask = np.zeros(pts_w.shape[0], dtype=bool) if coverage_priority else None
+                total_new_coverage = 0
+
+                candidate_progress = ProgressReporter(
+                    self.logger,
+                    phase="candidate_scan",
+                    total=max(1, n * orientation_count),
+                    min_interval=self.limits.progress_interval,
+                )
+
+                candidate_counter = 0
+                pitch_rad = math.radians(pitch_offset)
+
+                for sample_idx, (p, u) in enumerate(zip(self.curve_samples, us)):
+                    self._check_cancel()
+                    if sample_idx % 3 == 0:
+                        _post_busy(f"Evaluating samples {sample_idx + 1}/{n}")
+                    t2 = tangent_on_spline(self.tck, u)
+                    fwd = normalize(t2)
+                    base_xy = np.array([fwd[0], fwd[1]], dtype=np.float32)
+
+                    for orient_idx, yaw_deg in enumerate(yaw_offsets):
+                        self._check_cancel()
+                        candidate_counter += 1
+                        rot_xy = rotate_xy(base_xy, yaw_deg)
+                        look = p + np.array([rot_xy[0], rot_xy[1], 0.0]) * 2.0
+                        look = 0.7 * look + 0.3 * center_all
+                        look[2] = look[2] - 0.2 + math.tan(pitch_rad) * 1.5
+                        T_wc = look_at(p, look, up=np.array([0, 0, 1.0]))
+
+                        visible_idx = visible_point_indices_chunked(
+                            T_wc,
+                            self.intr,
+                            pts_w,
+                            self.near,
+                            self.far,
+                            fov_h=self.args.fov,
+                            fov_v=self.args.fov * (self.args.imgh / self.args.imgw),
+                            chunk_size=self.limits.visibility_chunk,
+                        )
+                        visible_idx = np.asarray(visible_idx, dtype=np.int64)
+                        if visible_idx.size > 1:
+                            visible_idx = np.unique(visible_idx)
+                        vis_count = int(visible_idx.size)
+                        if vis_count < min_visible:
+                            candidate_progress.update(
+                                detail={"sample": sample_idx, "orientation": orient_idx, "visible": vis_count}
+                            )
                             continue
-                    keep.append(i)
-                    last_kept = i
+                        new_visible = 0
+                        if coverage_priority and covered_mask is not None:
+                            current_mask = covered_mask[visible_idx]
+                            new_visible = int(np.count_nonzero(~current_mask))
+                            if new_visible < min_new_visible:
+                                candidate_progress.update(
+                                    detail={
+                                        "sample": sample_idx,
+                                        "orientation": orient_idx,
+                                        "new_visible": new_visible,
+                                        "visible": vis_count,
+                                    }
+                                )
+                                continue
+                        if require_overlap and last_visible_idx is not None:
+                            ov = overlap_ratio_indices(last_visible_idx, visible_idx)
+                            if ov < min_overlap:
+                                candidate_progress.update(
+                                    detail={
+                                        "sample": sample_idx,
+                                        "orientation": orient_idx,
+                                        "overlap": float(ov),
+                                        "visible": vis_count,
+                                    }
+                                )
+                                continue
 
-                kept_poses = [poses[i] for i in keep]
-                kept_ids = keep
+                        kept_poses.append(T_wc)
+                        kept_meta.append(
+                            {
+                                "sample_index": int(sample_idx),
+                                "orientation_index": int(orient_idx),
+                                "yaw_offset_deg": float(yaw_deg),
+                                "pitch_offset_deg": float(pitch_offset),
+                                "visible_gaussians": int(vis_count),
+                                "new_visible_gaussians": int(new_visible),
+                            }
+                        )
+                        last_visible_idx = visible_idx
+                        if coverage_priority and covered_mask is not None:
+                            covered_mask[visible_idx] = True
+                            total_new_coverage += new_visible
+                        candidate_progress.update(
+                            detail={
+                                "kept": len(kept_poses),
+                                "sample": sample_idx,
+                                "orientation": orient_idx,
+                                **({"new_visible": int(new_visible)} if coverage_priority else {}),
+                            }
+                        )
 
-                print("Generating rendered images...")
-                sys.stdout.flush()
-                def _set_busy(msg: str):
-                    try:
-                        self._busy_label.text = msg
-                    except Exception:
-                        pass
-                gui.Application.instance.post_to_main_thread(self.window, lambda: _set_busy("Rendering RGB 0/%d" % (len(kept_poses),)))
+                candidate_progress.finish(detail={"kept": len(kept_poses)})
+
+                if not kept_poses:
+                    raise RuntimeError(
+                        "No frames satisfied visibility/overlap limits. Soften thresholds and retry."
+                    )
+
+                self.logger.log(
+                    "poses_selected",
+                    generation=generation_id,
+                    candidates=int(candidate_counter),
+                    kept=len(kept_poses),
+                    min_visible=min_visible,
+                    min_overlap=min_overlap,
+                    coverage_priority=coverage_priority,
+                    min_new_visible=min_new_visible,
+                    enforce_overlap=require_overlap,
+                    total_new_coverage=int(total_new_coverage),
+                    orientations_per_point=int(orientation_count),
+                    orientation_span_deg=float(orientation_span),
+                    pitch_offset_deg=float(pitch_offset),
+                )
+                _post_busy(f"Selected {len(kept_poses)} poses. Loading scene...")
 
                 os.makedirs(self.args.img_paths, exist_ok=True)
                 os.makedirs(self.args.depth_paths, exist_ok=True)
 
                 from load_ply import load_gaussians_from_ply
                 scene = load_gaussians_from_ply(self.args.gaussians, device="cuda")
+                import torch as torch_mod
+
+                self._check_cancel()
                 for k in scene:
                     scene[k] = scene[k].to("cuda").contiguous().float()
 
-                import torch
-                opacs  = torch.sigmoid(scene['opacity'].squeeze(-1)) 
-                scales = torch.exp(scene['scale'])
-
-                # scene['rot'] shape: (N,4)
-                q = scene['rot'].contiguous().float()  # 原始四元数
-
-                # ----- 自检顺序（启发式）：如果第4列均值绝对值最大，说明可能是 xyzw，需要重排到 wxyz -----
-                with torch.no_grad():
-                    col_abs_mean = q.abs().mean(dim=0)           # (4,)
-                    likely_xyzw = col_abs_mean[-1] > col_abs_mean[:-1].max()  # 第4列最大 → 怀疑是 w 在最后
+                opacs = torch_mod.sigmoid(scene['opacity'].squeeze(-1))
+                scales = torch_mod.exp(scene['scale'])
+                q = scene['rot'].contiguous().float()
+                with torch_mod.no_grad():
+                    col_abs_mean = q.abs().mean(dim=0)
+                    likely_xyzw = col_abs_mean[-1] > col_abs_mean[:-1].max()
                 if likely_xyzw:
-                    q = q[:, [3, 0, 1, 2]]   # xyzw -> wxyz
-
-                # 必须归一化（防数值漂移）
+                    q = q[:, [3, 0, 1, 2]]
                 q = q / q.norm(dim=1, keepdim=True).clamp_min(1e-8)
 
                 model = {
-                    "means": scene['xyz'],         # (N,3)
-                    "quats": q,        # (N,4)
-                    "scales": scales,       # (N,3)
-                    "opacities": opacs,     # (N,)
-                    "colors": scene['rgb']        # (N,3) in [0,1]
+                    "means": scene['xyz'],
+                    "quats": q,
+                    "scales": scales,
+                    "opacities": opacs,
+                    "colors": scene['rgb']
                 }
 
                 HFOV = math.radians(self.args.fov)
-                fx = fy = self.args.imgw / (2*math.tan(HFOV/2))
-                cx, cy = self.args.imgw/2.0, self.args.imgh/2.0
-
-                # 用 numpy K（render_* 接口会再转 tensor），无需先放 GPU
+                fx = fy = self.args.imgw / (2 * math.tan(HFOV / 2))
+                cx, cy = self.args.imgw / 2.0, self.args.imgh / 2.0
                 K = np.array([[fx, 0, cx],
                               [0, fy, cy],
                               [0,  0,  1]], dtype=np.float32)
                 intr = {"K": K, "width": self.args.imgw, "height": self.args.imgh}
-                # Build output paths
-                img_dir = os.path.join(self.args.img_paths, str(self.click_generation_num))
-                depth_dir = os.path.join(self.args.depth_paths, str(self.click_generation_num))
+
+                img_dir = os.path.join(self.args.img_paths, str(generation_id))
+                depth_dir = os.path.join(self.args.depth_paths, str(generation_id))
                 os.makedirs(img_dir, exist_ok=True)
                 os.makedirs(depth_dir, exist_ok=True)
                 img_paths = [os.path.join(img_dir, f"frame_{i:04d}.png") for i in range(len(kept_poses))]
                 depth_paths = [os.path.join(depth_dir, f"frame_{i:04d}.png") for i in range(len(kept_poses))]
 
-                # Render RGB strictly per-frame with real-time progress updates
-                rgb_success_ids = []
-                for idx, (pose, path) in enumerate(zip(kept_poses, img_paths)):
-                    gui.Application.instance.post_to_main_thread(
-                        self.window,
-                        lambda i=idx, N=len(kept_poses): _set_busy(f"Rendering RGB {i+1}/{N}")
+                def run_render_phase(phase: str, indices: List[int], paths: List[str], render_fn, label: str):
+                    if not indices:
+                        return []
+                    reporter = ProgressReporter(
+                        self.logger,
+                        phase=phase,
+                        total=len(indices),
+                        min_interval=self.limits.progress_interval,
                     )
-                    try:
-                        render_and_save_Twc([pose], [path], model, intr, device="cuda")
-                        rgb_success_ids.append(idx)
-                    except Exception as _e:
-                        print(f"[RGB] failed at {idx}: {_e}")
-                try:
-                    torch.cuda.synchronize()
-                except Exception:
-                    pass
+                    successes: List[int] = []
+                    batch = max(1, int(self.limits.render_batch_size))
+                    for start in range(0, len(indices), batch):
+                        self._check_cancel()
+                        batch_indices = indices[start:start + batch]
+                        poses_batch = [kept_poses[i] for i in batch_indices]
+                        paths_batch = [paths[i] for i in batch_indices]
+                        _post_busy(f"{label} {len(successes)}+{len(batch_indices)}/{len(indices)}")
+                        try:
+                            render_fn(poses_batch, paths_batch, model, intr, device="cuda")
+                            successes.extend(batch_indices)
+                            reporter.update(step=len(batch_indices), detail={"chunk_start": int(batch_indices[0])})
+                        except Exception as batch_err:
+                            self.logger.log(
+                                "phase_error",
+                                phase=phase,
+                                chunk_start=int(batch_indices[0]),
+                                error=str(batch_err),
+                            )
+                            for idx in batch_indices:
+                                self._check_cancel()
+                                try:
+                                    render_fn([kept_poses[idx]], [paths[idx]], model, intr, device="cuda")
+                                    successes.append(idx)
+                                    reporter.update(detail={"frame": int(idx)})
+                                except Exception as frame_err:
+                                    self.logger.log(
+                                        "frame_error",
+                                        phase=phase,
+                                        frame=int(idx),
+                                        error=str(frame_err),
+                                    )
+                    reporter.finish(detail={"success": len(successes)})
+                    return successes
 
-                # Render Depth strictly per-frame for frames with successful RGB
-                depth_success_ids = []
-                for j, i in enumerate(rgb_success_ids):
-                    gui.Application.instance.post_to_main_thread(
-                        self.window,
-                        lambda k=j, N=len(rgb_success_ids): _set_busy(f"Rendering Depth {k+1}/{N}")
-                    )
-                    try:
-                        render_depth_and_save_Twc([kept_poses[i]], [depth_paths[i]], model, intr, device="cuda", depth_scale=1000.0)
-                        depth_success_ids.append(i)
-                    except Exception as _e:
-                        print(f"[Depth] failed at {i}: {_e}")
-                try:
-                    torch.cuda.synchronize()
-                except Exception:
-                    pass
+                rgb_indices = list(range(len(kept_poses)))
+                _post_busy("Rendering RGB frames...")
+                rgb_success_ids = run_render_phase(
+                    phase="render_rgb",
+                    indices=rgb_indices,
+                    paths=img_paths,
+                    render_fn=render_and_save_Twc,
+                    label="RGB",
+                )
 
-                # Final set of frames we consider successfully rendered (use RGB success as ground truth)
-                final_ids = rgb_success_ids
+                if torch_mod is not None:
+                    try:
+                        torch_mod.cuda.synchronize()
+                    except Exception:
+                        pass
+
+                _post_busy("Rendering depth frames...")
+                depth_success_ids = run_render_phase(
+                    phase="render_depth",
+                    indices=rgb_success_ids,
+                    paths=depth_paths,
+                    render_fn=lambda poses, paths, model, intr, device="cuda": render_depth_and_save_Twc(
+                        poses, paths, model, intr, device=device, depth_scale=1000.0
+                    ),
+                    label="Depth",
+                )
+
+                if torch_mod is not None:
+                    try:
+                        torch_mod.cuda.synchronize()
+                    except Exception:
+                        pass
+
+                final_ids = sorted(rgb_success_ids)
+
+                audit_result = None
+                if audit_images and final_ids:
+                    audit_result = self._audit_render_quality(img_paths, final_ids, audit_sample_rate)
 
                 # Compose JSON only with successfully rendered frames to guarantee 1:1
                 out = {
@@ -842,7 +1240,13 @@ class App:
                     },
                     "poses": [
                         {
-                            "id": int(kept_ids[i]),
+                            "id": int(kept_meta[i]["sample_index"]),
+                            "sample_index": int(kept_meta[i]["sample_index"]),
+                            "orientation_index": int(kept_meta[i]["orientation_index"]),
+                            "yaw_offset_deg": float(kept_meta[i]["yaw_offset_deg"]),
+                            "pitch_offset_deg": float(kept_meta[i]["pitch_offset_deg"]),
+                            "visible_gaussians": int(kept_meta[i]["visible_gaussians"]),
+                            "new_visible_gaussians": int(kept_meta[i]["new_visible_gaussians"]),
                             "T_wc": np.asarray(kept_poses[i]).reshape(4, 4).tolist(),
                             "position": np.asarray(kept_poses[i])[:3, 3].tolist(),
                         }
@@ -850,13 +1254,28 @@ class App:
                     ],
                     "meta": {
                         "total_samples": int(n),
-                        "kept": len(kept_ids),
+                        "kept": len(kept_meta),
                         "rendered_rgb": len(final_ids),
                         "rendered_depth": int(len(set(final_ids) & set(depth_success_ids))),
                         "min_visible": int(min_visible),
                         "min_overlap": float(min_overlap),
                         "ds": float(self.ds_edit.double_value),
                         "click_generation": int(self.click_generation_num),
+                        "coverage_priority": bool(coverage_priority),
+                        "min_new_visible": int(min_new_visible),
+                        "enforce_overlap": bool(require_overlap),
+                        "total_new_coverage": int(total_new_coverage),
+                        "orientations_per_point": int(orientation_count),
+                        "orientation_span_deg": float(orientation_span),
+                        "pitch_offset_deg": float(pitch_offset),
+                        "audit_images": bool(audit_images),
+                        "audit_sample_rate": float(audit_sample_rate),
+                        "audit": audit_result,
+                        "limits": {
+                            "visibility_chunk": int(self.limits.visibility_chunk),
+                            "max_route_samples": int(self.limits.max_route_samples),
+                            "render_batch_size": int(self.limits.render_batch_size),
+                        },
                     }
                 }
                 os.makedirs(self.args.pose_outdir, exist_ok=True)
@@ -904,22 +1323,42 @@ class App:
                     pass
 
                 summary = (
-                    f"Kept frames: {len(kept_ids)}/{n}. "
-                    f"Rendered RGB: {len(final_ids)}/{len(kept_ids)}. "
+                    f"Kept frames: {len(kept_meta)}/{candidate_counter}. "
+                    f"Rendered RGB: {len(final_ids)}/{len(kept_meta)}. "
                     f"Rendered Depth: {len(set(final_ids) & set(depth_success_ids))}/{len(final_ids)}.\n"
                     f"Cleaned extras -> RGB: {removed_rgb}, Depth: {removed_depth}.\n"
                     f"JSON: {json_path}\n"
                     f"RGB dir: {img_dir}\nDepth dir: {depth_dir}"
                 )
+                self.logger.log(
+                    "job_complete",
+                    generation=generation_id,
+                    kept=len(kept_meta),
+                    rendered_rgb=len(final_ids),
+                    rendered_depth=len(set(final_ids) & set(depth_success_ids)),
+                )
                 gui.Application.instance.post_to_main_thread(self.window, lambda: self._notify("Done", summary))
 
+            except CancelledError:
+                self.logger.log("job_cancelled", generation=getattr(self, "click_generation_num", -1))
+                gui.Application.instance.post_to_main_thread(
+                    self.window,
+                    lambda: self._notify("Cancelled", "Job cancelled. Partial outputs (if any) remain on disk."),
+                )
             except Exception as e:
                 tb = traceback.format_exc()
                 print(tb, file=sys.stderr)
                 sys.stderr.flush()
                 _msg = str(e)
+                self.logger.log("job_failed", error=_msg)
                 gui.Application.instance.post_to_main_thread(self.window, lambda m=_msg: self._notify("Error", m))
             finally:
+                self._cancel_event.clear()
+                if torch_mod is not None:
+                    try:
+                        torch_mod.cuda.empty_cache()
+                    except Exception:
+                        pass
                 def _clear_busy():
                     try:
                         self._busy_label.text = ""
@@ -930,6 +1369,76 @@ class App:
 
         self._is_busy = True
         threading.Thread(target=worker, daemon=True).start()
+
+    def _audit_render_quality(self, img_paths: List[str], kept_indices: List[int], sample_rate: float):
+        sr = float(np.clip(sample_rate, 0.0, 1.0))
+        total = len(kept_indices)
+        if total == 0 or sr <= 0.0:
+            return {"sampled": 0, "total": total, "issues": []}
+        if sr >= 0.999 or total == 1:
+            chosen = kept_indices
+        else:
+            sample_count = max(1, int(math.ceil(total * sr)))
+            lin_idx = np.linspace(0, total - 1, sample_count).astype(int)
+            chosen = [kept_indices[i] for i in lin_idx]
+
+        metrics = []
+        issues = []
+        for pose_idx in chosen:
+            path = img_paths[pose_idx]
+            try:
+                img = imageio.imread(path)
+            except Exception as err:
+                rec = {"frame": int(pose_idx), "path": path, "error": str(err)}
+                issues.append(rec)
+                self.logger.log("audit_error", **rec)
+                continue
+            arr = np.asarray(img, dtype=np.float32)
+            if arr.ndim == 2:
+                arr = np.expand_dims(arr, -1)
+            if arr.shape[-1] == 1:
+                arr = np.repeat(arr, 3, axis=-1)
+            arr = arr / 255.0
+            lum = arr[..., 0] * 0.2126 + arr[..., 1] * 0.7152 + arr[..., 2] * 0.0722
+            mean = float(lum.mean())
+            std = float(lum.std())
+            sat_hi = float((arr >= 0.99).mean())
+            sat_lo = float((arr <= 0.01).mean())
+            record = {
+                "frame": int(pose_idx),
+                "path": path,
+                "mean_luminance": mean,
+                "std_luminance": std,
+                "saturation_high": sat_hi,
+                "saturation_low": sat_lo,
+            }
+            metrics.append(record)
+            if mean < 0.05 or mean > 0.95 or std < 0.02 or sat_hi > 0.25:
+                warn = {
+                    "frame": int(pose_idx),
+                    "path": path,
+                    "mean": mean,
+                    "std": std,
+                    "sat_high": sat_hi,
+                    "sat_low": sat_lo,
+                }
+                issues.append(warn)
+                self.logger.log("audit_warning", **warn)
+
+        if metrics:
+            agg = {
+                "sampled": len(metrics),
+                "total": total,
+                "mean_luminance": float(np.mean([m["mean_luminance"] for m in metrics])),
+                "std_luminance": float(np.mean([m["std_luminance"] for m in metrics])),
+                "saturation_high": float(np.mean([m["saturation_high"] for m in metrics])),
+                "saturation_low": float(np.mean([m["saturation_low"] for m in metrics])),
+                "issues": issues,
+            }
+        else:
+            agg = {"sampled": 0, "total": total, "issues": issues}
+        self.logger.log("audit_summary", **agg)
+        return agg
 
 # ==========================
 # Entry
@@ -943,6 +1452,23 @@ def main():
     parser.add_argument("--depth_paths", type=str, default="./manual_out_depth", help="Path to the output depth maps")
     parser.add_argument("--default_scale", type=float, default=0.05, help="Default Gaussian approx scale for .ply")
 
+    # Resource / safety controls
+    parser.add_argument("--max-gaussians", type=int, default=int(os.environ.get("GSR_MAX_GAUSSIANS", 0)),
+                        help="Fail if Gaussian count exceeds this (0 disables check).")
+    parser.add_argument("--allow-gaussian-downsample", action="store_true",
+                        help="Downsample Gaussians deterministically when exceeding --max-gaussians.")
+    parser.add_argument("--visibility-chunk", type=int, default=int(os.environ.get("GSR_VISIBILITY_CHUNK", 500000)),
+                        help="Max number of Gaussians processed per visibility batch.")
+    parser.add_argument("--max-route-samples", type=int, default=int(os.environ.get("GSR_MAX_ROUTE_SAMPLES", 4000)),
+                        help="Maximum allowed sampled path points before enforcing limits (0 disables).")
+    parser.add_argument("--auto-downsample-route", action="store_true",
+                        help="Automatically subsample the route when sampling exceeds --max-route-samples.")
+    parser.add_argument("--render-batch-size", type=int, default=int(os.environ.get("GSR_RENDER_BATCH_SIZE", 4)),
+                        help="Number of frames rendered per batch to bound GPU usage.")
+    parser.add_argument("--progress-interval-sec", type=float,
+                        default=float(os.environ.get("GSR_PROGRESS_INTERVAL_SEC", 0.5)),
+                        help="Minimum seconds between structured progress logs.")
+
     # Camera / frustum
     parser.add_argument("--fov", type=float, default=70.0)
     parser.add_argument("--imgw", type=int, default=1920)
@@ -954,6 +1480,34 @@ def main():
     parser.add_argument("--ds", type=float, default=0.3, help="Path sampling spacing")
     parser.add_argument("--overlap_ratio", type=float, default=0.4, help="Jaccard overlap threshold [0,1]")
     parser.add_argument("--min_visible", type=int, default=800, help="Min visible centers per frame")
+    parser.add_argument("--min-new-visible", type=int,
+                        default=int(os.environ.get("GSR_MIN_NEW_VISIBLE", 200)),
+                        help="Minimum newly covered Gaussian centers per kept frame when coverage priority is enabled.")
+    parser.add_argument("--coverage-priority", dest="coverage_priority", action="store_true",
+                        help="Prefer keeping frames that add novel Gaussian coverage (default).")
+    parser.add_argument("--no-coverage-priority", dest="coverage_priority", action="store_false",
+                        help="Disable coverage-driven filtering.")
+    parser.add_argument("--enforce-overlap", dest="enforce_overlap", action="store_true",
+                        help="Require overlap checks even when coverage priority is met.")
+    parser.add_argument("--no-enforce-overlap", dest="enforce_overlap", action="store_false",
+                        help="Disable overlap continuity checks.")
+    parser.add_argument("--orientations-per-point", type=int,
+                        default=int(os.environ.get("GSR_ORIENTATIONS_PER_POINT", 3)),
+                        help="Number of camera orientations generated per sampled waypoint (minimum 2 enforced).")
+    parser.add_argument("--orientation-span-deg", type=float,
+                        default=float(os.environ.get("GSR_ORIENTATION_SPAN_DEG", 60.0)),
+                        help="Total horizontal angular span (deg) covered by the orientations.")
+    parser.add_argument("--pitch-offset-deg", type=float,
+                        default=float(os.environ.get("GSR_PITCH_OFFSET_DEG", -12.0)),
+                        help="Additional pitch offset (deg, negative looks downward).")
+    parser.add_argument("--audit-images", dest="audit_images", action="store_true",
+                        help="Enable post-render image quality auditing.")
+    parser.add_argument("--no-audit-images", dest="audit_images", action="store_false",
+                        help="Disable image quality auditing.")
+    parser.add_argument("--audit-sample-rate", type=float,
+                        default=float(os.environ.get("GSR_AUDIT_SAMPLE_RATE", 0.5)),
+                        help="Fraction of rendered RGB frames to audit (0-1).")
+    parser.set_defaults(coverage_priority=True, enforce_overlap=False, audit_images=True)
     
     args = parser.parse_args()
 

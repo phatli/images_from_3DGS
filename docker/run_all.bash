@@ -23,6 +23,15 @@ PYTORCH_CUDA_ALLOC_CONF_ENV=${PYTORCH_CUDA_ALLOC_CONF_ENV:-max_split_size_mb:64}
 # 选择 Dockerfile：默认使用部署版
 DOCKERFILE="${DOCKERFILE:-${ROOT_DIR}/docker/Dockerfile.deploy}"
 
+# 资源与批处理配置
+MAX_GAUSSIANS=${MAX_GAUSSIANS:-25000000}
+ALLOW_GAUSSIAN_DOWNSAMPLE=${ALLOW_GAUSSIAN_DOWNSAMPLE:-false}
+VISIBILITY_CHUNK=${VISIBILITY_CHUNK:-500000}
+MAX_ROUTE_SAMPLES=${MAX_ROUTE_SAMPLES:-4000}
+AUTO_DOWNSAMPLE_ROUTE=${AUTO_DOWNSAMPLE_ROUTE:-false}
+RENDER_BATCH_SIZE=${RENDER_BATCH_SIZE:-4}
+PROGRESS_INTERVAL_SEC=${PROGRESS_INTERVAL_SEC:-0.5}
+
 GAUSSIANS="${GAUSSIANS:-${ROOT_DIR}/src/data/point_cloud_gs.ply}"
 OUTDIR="${OUTDIR:-${ROOT_DIR}/output}"
 FOV="${FOV:-70}"
@@ -34,6 +43,14 @@ FAR="${FAR:-20.0}"
 MIN_VISIBLE="${MIN_VISIBLE:-800}"
 OVERLAP_RATIO="${OVERLAP_RATIO:-0.4}"
 DS="${DS:-0.3}"
+COVERAGE_PRIORITY=${COVERAGE_PRIORITY:-true}
+MIN_NEW_VISIBLE=${MIN_NEW_VISIBLE:-200}
+ENFORCE_OVERLAP=${ENFORCE_OVERLAP:-false}
+ORIENTATIONS_PER_POINT=${ORIENTATIONS_PER_POINT:-3}
+ORIENTATION_SPAN_DEG=${ORIENTATION_SPAN_DEG:-60}
+PITCH_OFFSET_DEG=${PITCH_OFFSET_DEG:--12}
+AUDIT_IMAGES=${AUDIT_IMAGES:-true}
+AUDIT_SAMPLE_RATE=${AUDIT_SAMPLE_RATE:-0.5}
 
 print_help() {
   cat <<EOF
@@ -54,6 +71,26 @@ Usage: $(basename "$0") [options]
   --min-visible N            默认: $MIN_VISIBLE
   --overlap-ratio F          默认: $OVERLAP_RATIO
   --ds F                     默认: $DS
+  --coverage-priority        启用覆盖优先策略（默认开启）
+  --no-coverage-priority     关闭覆盖优先策略
+  --min-new-visible N        每帧需新增可见点数量（默认: $MIN_NEW_VISIBLE）
+  --enforce-overlap          仍然要求帧间重叠（默认关闭）
+  --no-enforce-overlap       显式关闭重叠约束
+  --orientations-per-point N 每个路径点自动生成的朝向数量（默认: $ORIENTATIONS_PER_POINT）
+  --orientation-span-deg F   多朝向在水平面的总夹角（度，默认: $ORIENTATION_SPAN_DEG）
+  --pitch-offset-deg F       额外俯仰偏移（度，默认: $PITCH_OFFSET_DEG）
+  --audit-images             渲染后执行图像质量审计（默认开启）
+  --no-audit-images          关闭图像质量审计
+  --audit-sample-rate F      审计采样率 0-1（默认: $AUDIT_SAMPLE_RATE）
+
+# 资源与批处理
+  --max-gaussians N          超出时拒绝/下采样（默认: $MAX_GAUSSIANS；0 表示不限制）
+  --allow-gaussian-downsample 默认拒绝超限；启用后自动均匀下采样至上限
+  --visibility-chunk N       每次可见性检测处理的最大高斯数量（默认 $VISIBILITY_CHUNK）
+  --max-route-samples N      路径最大采样点数（默认 $MAX_ROUTE_SAMPLES）
+  --auto-downsample-route    允许自动稀疏路径以满足上限
+  --render-batch-size N      渲染批大小（默认 $RENDER_BATCH_SIZE）
+  --progress-interval SEC    结构化进度日志间隔（默认 $PROGRESS_INTERVAL_SEC 秒）
 
 # Docker 相关
   --name NAME                容器名，默认: $CONTAINER_NAME
@@ -94,6 +131,24 @@ while [[ $# -gt 0 ]]; do
     --min-visible)     MIN_VISIBLE="$2"; shift 2;;
     --overlap-ratio)   OVERLAP_RATIO="$2"; shift 2;;
     --ds)              DS="$2"; shift 2;;
+    --coverage-priority) COVERAGE_PRIORITY=true; shift 1;;
+    --no-coverage-priority) COVERAGE_PRIORITY=false; shift 1;;
+    --min-new-visible) MIN_NEW_VISIBLE="$2"; shift 2;;
+    --enforce-overlap) ENFORCE_OVERLAP=true; shift 1;;
+    --no-enforce-overlap) ENFORCE_OVERLAP=false; shift 1;;
+    --orientations-per-point) ORIENTATIONS_PER_POINT="$2"; shift 2;;
+    --orientation-span-deg) ORIENTATION_SPAN_DEG="$2"; shift 2;;
+    --pitch-offset-deg) PITCH_OFFSET_DEG="$2"; shift 2;;
+    --audit-images) AUDIT_IMAGES=true; shift 1;;
+    --no-audit-images) AUDIT_IMAGES=false; shift 1;;
+    --audit-sample-rate) AUDIT_SAMPLE_RATE="$2"; shift 2;;
+    --max-gaussians)   MAX_GAUSSIANS="$2"; shift 2;;
+    --allow-gaussian-downsample) ALLOW_GAUSSIAN_DOWNSAMPLE=true; shift 1;;
+    --visibility-chunk) VISIBILITY_CHUNK="$2"; shift 2;;
+    --max-route-samples) MAX_ROUTE_SAMPLES="$2"; shift 2;;
+    --auto-downsample-route) AUTO_DOWNSAMPLE_ROUTE=true; shift 1;;
+    --render-batch-size) RENDER_BATCH_SIZE="$2"; shift 2;;
+    --progress-interval) PROGRESS_INTERVAL_SEC="$2"; shift 2;;
 
     --name)            CONTAINER_NAME="$2"; shift 2;;
     --image)           IMAGE="$2"; shift 2;;
@@ -128,6 +183,53 @@ if [[ ! -f "$GAUSSIANS_HOST_ABS" ]]; then
 fi
 mkdir -p "$OUTDIR_HOST_ABS" "$OUTDIR_HOST_ABS/rgb" "$OUTDIR_HOST_ABS/depth" "$OUTDIR_HOST_ABS/poses"
 
+GAUSS_FILE_SIZE=$(stat -c%s "$GAUSSIANS_HOST_ABS" 2>/dev/null || echo 0)
+if [[ "$GAUSS_FILE_SIZE" -gt 0 ]]; then
+  HUMAN_SIZE=$(numfmt --to=iec "${GAUSS_FILE_SIZE}" 2>/dev/null || echo "${GAUSS_FILE_SIZE}")
+  echo "==> Gaussians file size: ${HUMAN_SIZE} (${GAUSS_FILE_SIZE} bytes)"
+fi
+
+GAUSSIAN_COUNT=$(
+python3 - "$GAUSSIANS_HOST_ABS" 2>/dev/null <<'PY'
+import os, sys, re
+path = sys.argv[1]
+ext = os.path.splitext(path)[1].lower()
+count = -1
+try:
+    if ext == ".npz":
+        try:
+            import numpy as np  # type: ignore
+        except Exception:
+            count = -1
+        else:
+            data = np.load(path, mmap_mode="r")
+            if "means" in data:
+                count = int(data["means"].shape[0])
+    elif ext == ".ply":
+        with open(path, "rb") as f:
+            header = f.read(4096).decode("utf-8", "ignore")
+        m = re.search(r"element\\s+vertex\\s+(\\d+)", header)
+        if m:
+            count = int(m.group(1))
+except Exception:
+    count = -1
+print(count)
+PY
+)
+
+if [[ "$GAUSSIAN_COUNT" =~ ^[0-9]+$ && "$GAUSSIAN_COUNT" -gt 0 ]]; then
+  echo "==> Estimated gaussian count: $GAUSSIAN_COUNT"
+  if [[ "$MAX_GAUSSIANS" -gt 0 && "$GAUSSIAN_COUNT" -gt "$MAX_GAUSSIANS" && "$ALLOW_GAUSSIAN_DOWNSAMPLE" != "true" ]]; then
+    cat <<EOF >&2
+!! Gaussian count ($GAUSSIAN_COUNT) exceeds --max-gaussians ($MAX_GAUSSIANS).
+   Re-run with --allow-gaussian-downsample or raise --max-gaussians to proceed safely.
+EOF
+    exit 2
+  fi
+else
+  GAUSSIAN_COUNT=-1
+fi
+
 if command -v xhost >/dev/null 2>&1; then
   xhost +local:root >/dev/null 2>&1 || true
 fi
@@ -135,9 +237,10 @@ fi
 GAUSSIANS_C="/mnt/gaussians.ply"
 OUTDIR_C="/workspace/output"
 
-CONTAINER_CMD="cd manual_splat && \
+CONTAINER_CMD=$(cat <<EOF
+cd manual_splat && \
 python3 manual_plane.py \
-    --gaussians \"$GAUSSIANS_C\" \
+    --gaussians "$GAUSSIANS_C" \
     --fov $FOV \
     --imgw $IMGW \
     --imgh $IMGH \
@@ -146,9 +249,43 @@ python3 manual_plane.py \
     --min_visible $MIN_VISIBLE \
     --overlap_ratio $OVERLAP_RATIO \
     --ds $DS \
-    --img_paths \"$OUTDIR_C/rgb\" \
-    --depth_paths \"$OUTDIR_C/depth\" \
-    --pose_outdir \"$OUTDIR_C/poses\""
+    --img_paths "$OUTDIR_C/rgb" \
+    --depth_paths "$OUTDIR_C/depth" \
+    --pose_outdir "$OUTDIR_C/poses" \
+    --max-gaussians $MAX_GAUSSIANS \
+    --visibility-chunk $VISIBILITY_CHUNK \
+    --max-route-samples $MAX_ROUTE_SAMPLES \
+    --render-batch-size $RENDER_BATCH_SIZE \
+    --progress-interval-sec $PROGRESS_INTERVAL_SEC \
+    --min-new-visible $MIN_NEW_VISIBLE \
+    --orientations-per-point $ORIENTATIONS_PER_POINT \
+    --orientation-span-deg $ORIENTATION_SPAN_DEG \
+    --pitch-offset-deg $PITCH_OFFSET_DEG \
+    --audit-sample-rate $AUDIT_SAMPLE_RATE
+EOF
+)
+
+if [[ "$ALLOW_GAUSSIAN_DOWNSAMPLE" == "true" ]]; then
+  CONTAINER_CMD+=$' \\\n    --allow-gaussian-downsample'
+fi
+if [[ "$AUTO_DOWNSAMPLE_ROUTE" == "true" ]]; then
+  CONTAINER_CMD+=$' \\\n    --auto-downsample-route'
+fi
+if [[ "$COVERAGE_PRIORITY" == "true" ]]; then
+  CONTAINER_CMD+=$' \\\n    --coverage-priority'
+else
+  CONTAINER_CMD+=$' \\\n    --no-coverage-priority'
+fi
+if [[ "$ENFORCE_OVERLAP" == "true" ]]; then
+  CONTAINER_CMD+=$' \\\n    --enforce-overlap'
+else
+  CONTAINER_CMD+=$' \\\n    --no-enforce-overlap'
+fi
+if [[ "$AUDIT_IMAGES" == "true" ]]; then
+  CONTAINER_CMD+=$' \\\n    --audit-images'
+else
+  CONTAINER_CMD+=$' \\\n    --no-audit-images'
+fi
 
 # --------------------
 # GPU 预检（防止 CPU 回退）

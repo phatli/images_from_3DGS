@@ -155,25 +155,33 @@ def render_and_save_rt(
     mdl = _ensure_model_tensors(model, device)
     K_torch, W, H = _make_K_tensor(intrinsics, device)
 
+    poses_list = list(poses_rt)
+    paths_list = list(img_paths)
+    if len(poses_list) != len(paths_list):
+        raise ValueError("poses_rt and img_paths must have the same length")
+
     saved = []
     
-    for (R, t), path in zip(poses_rt, img_paths):
+    for idx, ((R, t), path) in enumerate(zip(poses_list, paths_list)):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         viewmats = _rt_to_viewmat(R, t, device)  # (1,4,4)
 
-        imgs, meta_img, meta = gs.rasterization(
-            means=mdl["means"],      # (N,3)
-            quats=mdl["quats"],      # (N,4) (w,x,y,z)
-            scales=mdl["scales"],    # (N,3)
-            opacities=mdl["opacities"],  # (N,)
-            colors=mdl["colors"],    # (N,3)
-            viewmats=viewmats,       # (1,4,4) world->camera
-            Ks=K_torch,              # (1,3,3)
-            width=W, height=H,
-            render_mode=render_mode,
-            rasterize_mode=rasterize_mode,
-            radius_clip=radius_clip
-        )
+        try:
+            imgs, meta_img, meta = gs.rasterization(
+                means=mdl["means"],      # (N,3)
+                quats=mdl["quats"],      # (N,4) (w,x,y,z)
+                scales=mdl["scales"],    # (N,3)
+                opacities=mdl["opacities"],  # (N,)
+                colors=mdl["colors"],    # (N,3)
+                viewmats=viewmats,       # (1,4,4) world->camera
+                Ks=K_torch,              # (1,3,3)
+                width=W, height=H,
+                render_mode=render_mode,
+                rasterize_mode=rasterize_mode,
+                radius_clip=radius_clip
+            )
+        except RuntimeError as err:
+            raise RuntimeError(f"gs.rasterization failed at frame {idx} ({path}): {err}") from err
 
         rgb = imgs[0].clamp(0, 1).detach().cpu().numpy()  # (H,W,3)
         rgb_u8 = (rgb * 255.0 + 0.5).astype(np.uint8)
