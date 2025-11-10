@@ -20,7 +20,14 @@ Usage (example):
     python manual_plane.py \
         --gaussians path/to/model_means_scales.npz \
         --fov 70 --imgw 1920 --imgh 1080 --near 0.1 --far 20.0 \
-        --min_visible 800 --overlap_ratio 0.4 --ds 0.3
+        --min_visible 800 --overlap_ratio 0.4 --ds 0.3 \
+        --yaw-step-deg 45 --min-content-ratio 0.2 --similarity-threshold 0.92
+
+Key recent additions:
+    --yaw-step-deg            Controls 360° azimuth sampling density per waypoint.
+    --valid-region-bounds     Optional manual AABB to keep poses inside the GS footprint.
+    --min-content-ratio       Rejects rendered views with too little valid GS content.
+    --similarity-threshold    Drops highly redundant frames via fast grayscale correlation.
 
 Accepted Gaussian inputs:
 - .npz: keys 'means' (N,3) and optional 'scales' (N,3)
@@ -195,6 +202,61 @@ def rotate_xy(vec: np.ndarray, yaw_deg: float) -> np.ndarray:
     c, s = math.cos(rad), math.sin(rad)
     rot = np.array([v[0] * c - v[1] * s, v[0] * s + v[1] * c], dtype=np.float32)
     return rot
+
+
+def wrap_angle_deg(deg: float) -> float:
+    return (float(deg) + 360.0) % 360.0
+
+
+def angular_distance_deg(a: float, b: float) -> float:
+    diff = wrap_angle_deg(a) - wrap_angle_deg(b)
+    diff = (diff + 180.0) % 360.0 - 180.0
+    return abs(diff)
+
+
+def enforce_min_angular_step(angles: np.ndarray, min_step: float) -> np.ndarray:
+    if angles.size == 0:
+        return angles
+    min_step = max(0.0, float(min_step))
+    if min_step <= 1e-5:
+        return angles
+    ordered = [wrap_angle_deg(a) for a in angles.tolist()]
+    kept: List[float] = []
+    for ang in ordered:
+        if all(angular_distance_deg(ang, prev) >= min_step for prev in kept):
+            kept.append(ang)
+    if not kept:
+        kept = [ordered[0]]
+    return np.asarray(kept, dtype=np.float32)
+
+
+def point_in_aabb(pt: np.ndarray, bounds: Tuple[float, float, float, float, float, float]) -> bool:
+    x, y, z = pt
+    xmin, xmax, ymin, ymax, zmin, zmax = bounds
+    return xmin <= x <= xmax and ymin <= y <= ymax and zmin <= z <= zmax
+
+
+def ray_aabb_intersection(origin: np.ndarray, direction: np.ndarray,
+                          bounds: Tuple[float, float, float, float, float, float]) -> bool:
+    dir_eps = 1e-9
+    tmin, tmax = -np.inf, np.inf
+    for axis, (mn, mx) in enumerate([(bounds[0], bounds[1]),
+                                     (bounds[2], bounds[3]),
+                                     (bounds[4], bounds[5])]):
+        o = origin[axis]
+        d = direction[axis]
+        if abs(d) < dir_eps:
+            if o < mn or o > mx:
+                return False
+            continue
+        inv = 1.0 / d
+        t1 = (mn - o) * inv
+        t2 = (mx - o) * inv
+        tmin = max(tmin, min(t1, t2))
+        tmax = min(tmax, max(t1, t2))
+        if tmax < max(tmin, 0.0):
+            return False
+    return tmax > max(tmin, 0.0)
 
 
 # ==========================
@@ -402,6 +464,16 @@ class App:
         self.intr = CameraIntrinsics.from_fov(args.imgw, args.imgh, args.fov)
         self.near = args.near
         self.far = args.far
+        self.valid_region_margin = max(0.0, float(getattr(args, "valid_region_margin", 0.0)))
+        self.valid_region_bounds = self._init_valid_region_bounds()
+        self.yaw_step_deg = float(getattr(args, "yaw_step_deg", -1.0))
+        self.min_yaw_step_deg = max(0.0, float(getattr(args, "min_yaw_step_deg", 0.0)))
+        self.min_pitch_step_deg = max(0.0, float(getattr(args, "min_pitch_step_deg", 0.0)))
+        self.pitch_list_override = getattr(args, "pitch_list_deg", "")
+        self.min_content_ratio = max(0.0, float(getattr(args, "min_content_ratio", 0.0)))
+        self.similarity_threshold = float(getattr(args, "similarity_threshold", 0.0))
+        self.similarity_downsample = max(8, int(getattr(args, "similarity_downsample", 64)))
+        self.max_overlap_ratio = max(0.0, float(getattr(args, "max_overlap_ratio", 0.0)))
 
         self.limits = ResourceLimits(
             visibility_chunk=max(1, int(getattr(args, "visibility_chunk", 500_000))),
@@ -465,6 +537,39 @@ class App:
 
         self.logger.log("gaussian_limit_exceeded", original=total, limit=limit)
         raise RuntimeError(msg)
+
+    def _init_valid_region_bounds(self) -> Optional[Tuple[float, float, float, float, float, float]]:
+        pts = self.points
+        if pts is None or pts.shape[0] == 0:
+            return None
+        spec = getattr(self.args, "valid_region_bounds", "") or ""
+        if spec.strip():
+            parts = [p.strip() for p in spec.replace(";", ",").split(",") if p.strip()]
+            if len(parts) != 6:
+                raise ValueError("--valid-region-bounds expects 6 comma-separated floats: "
+                                 "xmin,xmax,ymin,ymax,zmin,zmax")
+            vals = list(map(float, parts))
+            bounds = (
+                min(vals[0], vals[1]), max(vals[0], vals[1]),
+                min(vals[2], vals[3]), max(vals[2], vals[3]),
+                min(vals[4], vals[5]), max(vals[4], vals[5]),
+            )
+        else:
+            mins = pts.min(axis=0) - self.valid_region_margin
+            maxs = pts.max(axis=0) + self.valid_region_margin
+            bounds = (float(mins[0]), float(maxs[0]),
+                      float(mins[1]), float(maxs[1]),
+                      float(mins[2]), float(maxs[2]))
+        self.logger.log(
+            "valid_region_bounds",
+            bounds={
+                "xmin": bounds[0], "xmax": bounds[1],
+                "ymin": bounds[2], "ymax": bounds[3],
+                "zmin": bounds[4], "zmax": bounds[5],
+            },
+            margin=float(self.valid_region_margin),
+        )
+        return bounds
 
     # ---------- Geometry name bookkeeping ----------
     def _add_geom(self, name, geom, material=None, group=None):
@@ -882,6 +987,163 @@ class App:
         if self._cancel_event.is_set():
             raise CancelledError("Operation cancelled by user.")
 
+    # ---------- Pose helper utilities ----------
+    def _build_yaw_candidates(self, orientation_count: int, orientation_span_deg: float) -> np.ndarray:
+        raw_step = float(self.yaw_step_deg)
+        if raw_step > 0:
+            step = max(raw_step, 1e-3)
+            yaw_angles = np.arange(0.0, 360.0, step, dtype=np.float32)
+        elif raw_step < 0:  # auto full coverage: 360 / count
+            count = max(1, int(orientation_count))
+            step = 360.0 / float(count)
+            yaw_angles = np.arange(0.0, 360.0, step, dtype=np.float32)
+        else:  # raw_step == 0 -> legacy span-based behavior
+            yaw_angles = orientation_offsets(max(1, int(orientation_count)), float(orientation_span_deg))
+            yaw_angles = np.asarray([wrap_angle_deg(a) for a in yaw_angles], dtype=np.float32)
+        yaw_angles = enforce_min_angular_step(yaw_angles, self.min_yaw_step_deg)
+        if yaw_angles.size == 0:
+            yaw_angles = np.array([0.0], dtype=np.float32)
+        return yaw_angles
+
+    def _resolve_pitch_candidates(self, base_pitch: float) -> List[float]:
+        entries: List[float] = []
+        if isinstance(self.pitch_list_override, str) and self.pitch_list_override.strip():
+            raw = self.pitch_list_override.replace(";", ",").split(",")
+            for token in raw:
+                token = token.strip()
+                if not token:
+                    continue
+                try:
+                    entries.append(float(token))
+                except ValueError:
+                    raise ValueError(f"Invalid pitch value '{token}' in --pitch-list-deg") from None
+        if not entries:
+            entries = [float(base_pitch)]
+        deduped: List[float] = []
+        for val in entries:
+            if not deduped:
+                deduped.append(val)
+                continue
+            if all(abs(val - ref) >= self.min_pitch_step_deg for ref in deduped):
+                deduped.append(val)
+        return deduped
+
+    def _pose_within_valid_region(self, cam_pos: np.ndarray, look_dir: np.ndarray) -> bool:
+        if self.valid_region_bounds is None:
+            return True
+        if not point_in_aabb(cam_pos, self.valid_region_bounds):
+            return False
+        return ray_aabb_intersection(cam_pos, look_dir, self.valid_region_bounds)
+
+    def _delete_outputs_for_frame(self, frame_idx: int, img_paths: List[str], depth_paths: List[str]):
+        for path in (img_paths[frame_idx], depth_paths[frame_idx] if frame_idx < len(depth_paths) else None):
+            if not path:
+                continue
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+
+    def _apply_content_ratio_filter(
+        self,
+        candidate_ids: List[int],
+        img_paths: List[str],
+        depth_paths: List[str],
+        depth_success_ids: List[int],
+    ) -> Tuple[List[int], List[int]]:
+        if self.min_content_ratio <= 0.0 or not candidate_ids:
+            return candidate_ids, []
+        accepted: List[int] = []
+        dropped: List[int] = []
+        depth_success = set(depth_success_ids)
+        for idx in candidate_ids:
+            if idx not in depth_success:
+                accepted.append(idx)
+                continue
+            depth_path = depth_paths[idx]
+            try:
+                depth = imageio.imread(depth_path)
+                arr = np.asarray(depth, dtype=np.float32)
+                if arr.ndim == 3:
+                    arr = arr[..., 0]
+                valid = np.count_nonzero(arr > 0)
+                ratio = float(valid) / float(arr.size) if arr.size > 0 else 0.0
+            except Exception as err:
+                self.logger.log("content_filter_error", frame=int(idx), error=str(err))
+                accepted.append(idx)
+                continue
+            if ratio < self.min_content_ratio:
+                dropped.append(idx)
+                self.logger.log(
+                    "content_filter_drop",
+                    frame=int(idx),
+                    ratio=float(ratio),
+                    threshold=float(self.min_content_ratio),
+                )
+                self._delete_outputs_for_frame(idx, img_paths, depth_paths)
+            else:
+                accepted.append(idx)
+        return accepted, dropped
+
+    def _load_similarity_vector(self, path: str) -> Optional[np.ndarray]:
+        if not os.path.exists(path):
+            return None
+        try:
+            img = imageio.imread(path)
+        except Exception as err:
+            self.logger.log("similarity_load_error", path=path, error=str(err))
+            return None
+        arr = np.asarray(img, dtype=np.float32)
+        if arr.ndim == 3:
+            gray = arr[..., 0] * 0.2126 + arr[..., 1] * 0.7152 + arr[..., 2] * 0.0722
+        else:
+            gray = arr.astype(np.float32)
+        step = max(1, int(math.ceil(max(gray.shape) / float(self.similarity_downsample))))
+        gray_ds = gray[::step, ::step]
+        flat = gray_ds.reshape(-1)
+        if flat.size == 0:
+            return None
+        flat = flat - flat.mean()
+        norm = np.linalg.norm(flat)
+        if norm < 1e-8:
+            return None
+        return flat / norm
+
+    def _apply_similarity_filter(
+        self,
+        candidate_ids: List[int],
+        img_paths: List[str],
+        depth_paths: List[str],
+    ) -> Tuple[List[int], List[int]]:
+        thr = float(self.similarity_threshold)
+        if thr <= 0.0 or thr > 1.0 or len(candidate_ids) < 2:
+            return candidate_ids, []
+        accepted: List[int] = []
+        dropped: List[int] = []
+        vectors: Dict[int, np.ndarray] = {}
+        for idx in candidate_ids:
+            vec = self._load_similarity_vector(img_paths[idx])
+            if vec is None:
+                accepted.append(idx)
+                continue
+            drop = False
+            for kept_idx in accepted:
+                other = vectors.get(kept_idx)
+                if other is None:
+                    continue
+                sim = float(np.dot(vec, other))
+                if sim >= thr:
+                    drop = True
+                    self.logger.log("similarity_filter_drop", frame=int(idx), match=int(kept_idx), similarity=sim)
+                    self._delete_outputs_for_frame(idx, img_paths, depth_paths)
+                    dropped.append(idx)
+                    break
+            if not drop:
+                accepted.append(idx)
+                vectors[idx] = vec
+        return accepted, dropped
+
     # ---------- Fit & sample ----------
     def _fit_and_sample(self):
         if len(self.picked_xy) < 2:
@@ -968,7 +1230,11 @@ class App:
                 orientation_count = max(2, int(self.orientation_count_edit.int_value))
                 orientation_span = float(self.orientation_span_edit.double_value)
                 pitch_offset = float(self.pitch_offset_edit.double_value)
-                yaw_offsets = orientation_offsets(orientation_count, orientation_span)
+                yaw_angles = self._build_yaw_candidates(orientation_count, orientation_span)
+                pitch_values = self._resolve_pitch_candidates(pitch_offset)
+                if not pitch_values:
+                    pitch_values = [float(pitch_offset)]
+                total_orientation_per_point = len(yaw_angles) * len(pitch_values)
                 audit_images = bool(getattr(self.audit_checkbox, "checked", True))
                 audit_sample_rate = float(np.clip(self.audit_rate_edit.double_value, 0.0, 1.0))
                 kept_poses: List[np.ndarray] = []
@@ -980,12 +1246,11 @@ class App:
                 candidate_progress = ProgressReporter(
                     self.logger,
                     phase="candidate_scan",
-                    total=max(1, n * orientation_count),
+                    total=max(1, n * total_orientation_per_point),
                     min_interval=self.limits.progress_interval,
                 )
 
                 candidate_counter = 0
-                pitch_rad = math.radians(pitch_offset)
 
                 for sample_idx, (p, u) in enumerate(zip(self.curve_samples, us)):
                     self._check_cancel()
@@ -995,84 +1260,119 @@ class App:
                     fwd = normalize(t2)
                     base_xy = np.array([fwd[0], fwd[1]], dtype=np.float32)
 
-                    for orient_idx, yaw_deg in enumerate(yaw_offsets):
-                        self._check_cancel()
-                        candidate_counter += 1
-                        rot_xy = rotate_xy(base_xy, yaw_deg)
-                        look = p + np.array([rot_xy[0], rot_xy[1], 0.0]) * 2.0
-                        look = 0.7 * look + 0.3 * center_all
-                        look[2] = look[2] - 0.2 + math.tan(pitch_rad) * 1.5
-                        T_wc = look_at(p, look, up=np.array([0, 0, 1.0]))
+                    for orient_idx, yaw_deg in enumerate(yaw_angles):
+                        for pitch_idx, current_pitch_deg in enumerate(pitch_values):
+                            self._check_cancel()
+                            candidate_counter += 1
+                            pitch_rad = math.radians(current_pitch_deg)
+                            rot_xy = rotate_xy(base_xy, yaw_deg)
+                            look = p + np.array([rot_xy[0], rot_xy[1], 0.0]) * 2.0
+                            look = 0.7 * look + 0.3 * center_all
+                            look[2] = look[2] - 0.2 + math.tan(pitch_rad) * 1.5
+                            view_dir = normalize(look - p)
+                            if not self._pose_within_valid_region(p, view_dir):
+                                candidate_progress.update(
+                                    detail={
+                                        "sample": sample_idx,
+                                        "orientation": orient_idx,
+                                        "pitch": float(current_pitch_deg),
+                                        "reason": "valid_region",
+                                    }
+                                )
+                                continue
+                            T_wc = look_at(p, look, up=np.array([0, 0, 1.0]))
 
-                        visible_idx = visible_point_indices_chunked(
-                            T_wc,
-                            self.intr,
-                            pts_w,
-                            self.near,
-                            self.far,
-                            fov_h=self.args.fov,
-                            fov_v=self.args.fov * (self.args.imgh / self.args.imgw),
-                            chunk_size=self.limits.visibility_chunk,
-                        )
-                        visible_idx = np.asarray(visible_idx, dtype=np.int64)
-                        if visible_idx.size > 1:
-                            visible_idx = np.unique(visible_idx)
-                        vis_count = int(visible_idx.size)
-                        if vis_count < min_visible:
-                            candidate_progress.update(
-                                detail={"sample": sample_idx, "orientation": orient_idx, "visible": vis_count}
+                            visible_idx = visible_point_indices_chunked(
+                                T_wc,
+                                self.intr,
+                                pts_w,
+                                self.near,
+                                self.far,
+                                fov_h=self.args.fov,
+                                fov_v=self.args.fov * (self.args.imgh / self.args.imgw),
+                                chunk_size=self.limits.visibility_chunk,
                             )
-                            continue
-                        new_visible = 0
-                        if coverage_priority and covered_mask is not None:
-                            current_mask = covered_mask[visible_idx]
-                            new_visible = int(np.count_nonzero(~current_mask))
-                            if new_visible < min_new_visible:
+                            visible_idx = np.asarray(visible_idx, dtype=np.int64)
+                            if visible_idx.size > 1:
+                                visible_idx = np.unique(visible_idx)
+                            vis_count = int(visible_idx.size)
+                            if vis_count < min_visible:
                                 candidate_progress.update(
                                     detail={
                                         "sample": sample_idx,
                                         "orientation": orient_idx,
-                                        "new_visible": new_visible,
+                                        "pitch": float(current_pitch_deg),
                                         "visible": vis_count,
                                     }
                                 )
                                 continue
-                        if require_overlap and last_visible_idx is not None:
-                            ov = overlap_ratio_indices(last_visible_idx, visible_idx)
-                            if ov < min_overlap:
+                            new_visible = 0
+                            if coverage_priority and covered_mask is not None:
+                                current_mask = covered_mask[visible_idx]
+                                new_visible = int(np.count_nonzero(~current_mask))
+                                if new_visible < min_new_visible:
+                                    candidate_progress.update(
+                                        detail={
+                                            "sample": sample_idx,
+                                            "orientation": orient_idx,
+                                            "pitch": float(current_pitch_deg),
+                                            "new_visible": new_visible,
+                                            "visible": vis_count,
+                                        }
+                                    )
+                                    continue
+                            current_overlap = None
+                            if last_visible_idx is not None and last_visible_idx.size > 0:
+                                current_overlap = overlap_ratio_indices(last_visible_idx, visible_idx)
+                            if require_overlap and current_overlap is not None and current_overlap < min_overlap:
                                 candidate_progress.update(
                                     detail={
                                         "sample": sample_idx,
                                         "orientation": orient_idx,
-                                        "overlap": float(ov),
-                                        "visible": vis_count,
+                                        "pitch": float(current_pitch_deg),
+                                        "overlap": float(current_overlap),
                                     }
                                 )
                                 continue
+                            if self.max_overlap_ratio > 0.0 and current_overlap is not None:
+                                if current_overlap > self.max_overlap_ratio:
+                                    candidate_progress.update(
+                                        detail={
+                                            "sample": sample_idx,
+                                            "orientation": orient_idx,
+                                            "pitch": float(current_pitch_deg),
+                                            "overlap": float(current_overlap),
+                                            "reason": "overlap_high",
+                                        }
+                                    )
+                                    continue
 
-                        kept_poses.append(T_wc)
-                        kept_meta.append(
-                            {
-                                "sample_index": int(sample_idx),
-                                "orientation_index": int(orient_idx),
-                                "yaw_offset_deg": float(yaw_deg),
-                                "pitch_offset_deg": float(pitch_offset),
-                                "visible_gaussians": int(vis_count),
-                                "new_visible_gaussians": int(new_visible),
-                            }
-                        )
-                        last_visible_idx = visible_idx
-                        if coverage_priority and covered_mask is not None:
-                            covered_mask[visible_idx] = True
-                            total_new_coverage += new_visible
-                        candidate_progress.update(
-                            detail={
-                                "kept": len(kept_poses),
-                                "sample": sample_idx,
-                                "orientation": orient_idx,
-                                **({"new_visible": int(new_visible)} if coverage_priority else {}),
-                            }
-                        )
+                            orientation_key = orient_idx * len(pitch_values) + pitch_idx
+                            kept_poses.append(T_wc)
+                            kept_meta.append(
+                                {
+                                    "sample_index": int(sample_idx),
+                                    "orientation_index": int(orientation_key),
+                                    "yaw_offset_deg": float(yaw_deg),
+                                    "pitch_offset_deg": float(current_pitch_deg),
+                                    "pitch_index": int(pitch_idx),
+                                    "visible_gaussians": int(vis_count),
+                                    "new_visible_gaussians": int(new_visible),
+                                }
+                            )
+                            last_visible_idx = visible_idx
+                            if coverage_priority and covered_mask is not None:
+                                covered_mask[visible_idx] = True
+                                total_new_coverage += new_visible
+                            candidate_progress.update(
+                                detail={
+                                    "kept": len(kept_poses),
+                                    "sample": sample_idx,
+                                    "orientation": orient_idx,
+                                    "pitch": float(current_pitch_deg),
+                                    **({"new_visible": int(new_visible)} if coverage_priority else {}),
+                                }
+                            )
 
                 candidate_progress.finish(detail={"kept": len(kept_poses)})
 
@@ -1092,9 +1392,12 @@ class App:
                     min_new_visible=min_new_visible,
                     enforce_overlap=require_overlap,
                     total_new_coverage=int(total_new_coverage),
-                    orientations_per_point=int(orientation_count),
+                    orientations_per_point=int(total_orientation_per_point),
                     orientation_span_deg=float(orientation_span),
+                    yaw_step_deg=float(self.yaw_step_deg),
+                    min_yaw_step_deg=float(self.min_yaw_step_deg),
                     pitch_offset_deg=float(pitch_offset),
+                    pitch_set=[float(p) for p in pitch_values],
                 )
                 _post_busy(f"Selected {len(kept_poses)} poses. Loading scene...")
 
@@ -1221,6 +1524,24 @@ class App:
 
                 final_ids = sorted(rgb_success_ids)
 
+                content_drops: List[int] = []
+                similarity_drops: List[int] = []
+                if final_ids:
+                    final_ids, content_drops = self._apply_content_ratio_filter(
+                        final_ids, img_paths, depth_paths, depth_success_ids
+                    )
+                    if content_drops:
+                        self.logger.log("content_filter_summary", dropped=len(content_drops))
+                    depth_success_ids = [idx for idx in depth_success_ids if idx in final_ids]
+                if final_ids:
+                    final_ids, similarity_drops = self._apply_similarity_filter(final_ids, img_paths, depth_paths)
+                    if similarity_drops:
+                        self.logger.log("similarity_filter_summary", dropped=len(similarity_drops))
+                    depth_success_ids = [idx for idx in depth_success_ids if idx in final_ids]
+
+                if not final_ids:
+                    raise RuntimeError("All frames were rejected after content/similarity filtering.")
+
                 audit_result = None
                 if audit_images and final_ids:
                     audit_result = self._audit_render_quality(img_paths, final_ids, audit_sample_rate)
@@ -1245,6 +1566,7 @@ class App:
                             "orientation_index": int(kept_meta[i]["orientation_index"]),
                             "yaw_offset_deg": float(kept_meta[i]["yaw_offset_deg"]),
                             "pitch_offset_deg": float(kept_meta[i]["pitch_offset_deg"]),
+                            "pitch_index": int(kept_meta[i].get("pitch_index", 0)),
                             "visible_gaussians": int(kept_meta[i]["visible_gaussians"]),
                             "new_visible_gaussians": int(kept_meta[i]["new_visible_gaussians"]),
                             "T_wc": np.asarray(kept_poses[i]).reshape(4, 4).tolist(),
@@ -1264,13 +1586,29 @@ class App:
                         "coverage_priority": bool(coverage_priority),
                         "min_new_visible": int(min_new_visible),
                         "enforce_overlap": bool(require_overlap),
+                        "max_overlap_ratio": float(self.max_overlap_ratio),
                         "total_new_coverage": int(total_new_coverage),
-                        "orientations_per_point": int(orientation_count),
+                        "orientations_per_point": int(total_orientation_per_point),
                         "orientation_span_deg": float(orientation_span),
+                        "yaw_step_deg": float(self.yaw_step_deg),
+                        "min_yaw_step_deg": float(self.min_yaw_step_deg),
                         "pitch_offset_deg": float(pitch_offset),
+                        "pitch_set": [float(p) for p in pitch_values],
                         "audit_images": bool(audit_images),
                         "audit_sample_rate": float(audit_sample_rate),
                         "audit": audit_result,
+                        "min_content_ratio": float(self.min_content_ratio),
+                        "content_filter_dropped": int(len(content_drops)),
+                        "similarity_threshold": float(self.similarity_threshold),
+                        "similarity_dropped": int(len(similarity_drops)),
+                        "valid_region_bounds": {
+                            "xmin": self.valid_region_bounds[0] if self.valid_region_bounds else None,
+                            "xmax": self.valid_region_bounds[1] if self.valid_region_bounds else None,
+                            "ymin": self.valid_region_bounds[2] if self.valid_region_bounds else None,
+                            "ymax": self.valid_region_bounds[3] if self.valid_region_bounds else None,
+                            "zmin": self.valid_region_bounds[4] if self.valid_region_bounds else None,
+                            "zmax": self.valid_region_bounds[5] if self.valid_region_bounds else None,
+                        },
                         "limits": {
                             "visibility_chunk": int(self.limits.visibility_chunk),
                             "max_route_samples": int(self.limits.max_route_samples),
@@ -1326,6 +1664,7 @@ class App:
                     f"Kept frames: {len(kept_meta)}/{candidate_counter}. "
                     f"Rendered RGB: {len(final_ids)}/{len(kept_meta)}. "
                     f"Rendered Depth: {len(set(final_ids) & set(depth_success_ids))}/{len(final_ids)}.\n"
+                    f"Content drops: {len(content_drops)}, Similarity drops: {len(similarity_drops)}.\n"
                     f"Cleaned extras -> RGB: {removed_rgb}, Depth: {removed_depth}.\n"
                     f"JSON: {json_path}\n"
                     f"RGB dir: {img_dir}\nDepth dir: {depth_dir}"
@@ -1497,9 +1836,39 @@ def main():
     parser.add_argument("--orientation-span-deg", type=float,
                         default=float(os.environ.get("GSR_ORIENTATION_SPAN_DEG", 60.0)),
                         help="Total horizontal angular span (deg) covered by the orientations.")
+    parser.add_argument("--yaw-step-deg", type=float,
+                        default=float(os.environ.get("GSR_YAW_STEP_DEG", -1.0)),
+                        help="Azimuth spacing (deg) for 360° coverage (-1 auto via orientations-per-point, 0 disables).")
+    parser.add_argument("--min-yaw-step-deg", type=float,
+                        default=float(os.environ.get("GSR_MIN_YAW_STEP_DEG", 0.0)),
+                        help="Minimum yaw separation (deg) enforced between candidate orientations.")
     parser.add_argument("--pitch-offset-deg", type=float,
                         default=float(os.environ.get("GSR_PITCH_OFFSET_DEG", -12.0)),
                         help="Additional pitch offset (deg, negative looks downward).")
+    parser.add_argument("--pitch-list-deg", type=str,
+                        default=os.environ.get("GSR_PITCH_LIST_DEG", ""),
+                        help="Optional comma-separated pitch degrees overriding --pitch-offset-deg.")
+    parser.add_argument("--min-pitch-step-deg", type=float,
+                        default=float(os.environ.get("GSR_MIN_PITCH_STEP_DEG", 0.0)),
+                        help="Minimum pitch separation enforced when --pitch-list-deg supplies multiple values.")
+    parser.add_argument("--max-overlap-ratio", type=float,
+                        default=float(os.environ.get("GSR_MAX_OVERLAP_RATIO", 0.0)),
+                        help="Optional maximum overlap ratio with previous kept frame to reduce redundancy (0 disables).")
+    parser.add_argument("--min-content-ratio", type=float,
+                        default=float(os.environ.get("GSR_MIN_CONTENT_RATIO", 0.0)),
+                        help="Reject rendered views whose valid depth coverage ratio falls below this threshold (0 disables).")
+    parser.add_argument("--similarity-threshold", type=float,
+                        default=float(os.environ.get("GSR_SIMILARITY_THRESHOLD", 0.0)),
+                        help="Drop frames whose grayscale correlation with earlier kept frames exceeds this value (0 disables).")
+    parser.add_argument("--similarity-downsample", type=int,
+                        default=int(os.environ.get("GSR_SIMILARITY_DOWNSAMPLE", 64)),
+                        help="Target max image size used during similarity checking (higher = slower).")
+    parser.add_argument("--valid-region-bounds", type=str,
+                        default=os.environ.get("GSR_VALID_REGION_BOUNDS", ""),
+                        help="Manual valid region AABB as xmin,xmax,ymin,ymax,zmin,zmax. Defaults to GS bounds.")
+    parser.add_argument("--valid-region-margin", type=float,
+                        default=float(os.environ.get("GSR_VALID_REGION_MARGIN", 0.5)),
+                        help="Margin (meters) padded onto auto valid-region bounds.")
     parser.add_argument("--audit-images", dest="audit_images", action="store_true",
                         help="Enable post-render image quality auditing.")
     parser.add_argument("--no-audit-images", dest="audit_images", action="store_false",
